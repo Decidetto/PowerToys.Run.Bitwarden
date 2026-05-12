@@ -1,13 +1,9 @@
 namespace PowerToys.Run.Bitwarden.Vault;
 
 // Pure-logic decision for whether OnSessionStateChanged should force a PT Run requery,
-// and what query to set if so. Split out from Main.cs so it can be tested without WPF.
-//
-// The decision exists to fix a UX bug: vault state transitions (initial boot finishing,
-// auto-lock firing, etc.) used to unconditionally call ChangeQuery, which clobbers the
-// user's input if they've moved on to another plugin's context. We gate the requery on
-// "is the user currently in our context", which is determined from PT Run's input box
-// text — captured by the caller and passed in here as `currentPtRunInput`.
+// and what query to set if so. Gates the requery on whether the user is currently in
+// our context (determined from PT Run's input box text, passed in as `currentPtRunInput`)
+// so background state transitions don't clobber a query they've typed for another plugin.
 internal static class StateRefreshDecision
 {
     // currentPtRunInput is null when PT Run is hidden or the input control couldn't be
@@ -29,8 +25,7 @@ internal static class StateRefreshDecision
         if (unlocked && !string.IsNullOrEmpty(pendingUnlockQuery))
             return (true, pendingUnlockQuery!);
 
-        // Filter to transitions that actually need a forced refresh — others resolve
-        // naturally on the user's next keystroke if/when they come back to us.
+        // Filter to transitions that actually need a forced refresh.
         var initialBootCompleting = !hasFinishedInitialBoot
             && newState is not (VaultState.Uninitialized or VaultState.Initializing);
         var lockingFromReady = newState == VaultState.Locked && hasBeenReady;
@@ -42,5 +37,14 @@ internal static class StateRefreshDecision
         if (currentPtRunInput is null) return (false, string.Empty);
         var inOurContext = currentPtRunInput.StartsWith(actionKeyword, StringComparison.OrdinalIgnoreCase);
         return inOurContext ? (true, defaultQuery) : (false, string.Empty);
+    }
+
+    // After an explicit user action (`:sync`, `:lock`), PT Run is reliably hidden by the
+    // time the operation completes (Enter on the result returned true). The Decide path
+    // above would skip the refresh on that null input.
+    public static bool ShouldRefreshAfterExplicitAction(string? currentPtRunInput, string actionKeyword)
+    {
+        if (currentPtRunInput is null) return true;
+        return currentPtRunInput.StartsWith(actionKeyword, StringComparison.OrdinalIgnoreCase);
     }
 }

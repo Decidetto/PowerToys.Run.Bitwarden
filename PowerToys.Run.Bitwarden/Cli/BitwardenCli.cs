@@ -30,7 +30,7 @@ internal sealed class BitwardenCli
         var path = Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
         foreach (var dir in path.Split(Path.PathSeparator))
         {
-            foreach (var name in new[] { "bw.exe", "bw.cmd", "bw" })
+            foreach (var name in new[] { "bw.exe", "bw" })
             {
                 try
                 {
@@ -99,19 +99,7 @@ internal sealed class BitwardenCli
         }
 
         using var proc = new Process { StartInfo = psi };
-        try
-        {
-            proc.Start();
-        }
-        finally
-        {
-            // Drop our references to any sensitive env values now that the child has its
-            // own copy. psi is local but the strings would otherwise linger on the heap
-            // until GC takes psi out of scope.
-            if (env != null)
-                foreach (var kv in env)
-                    psi.Environment.Remove(kv.Key);
-        }
+        proc.Start();
         var stdoutTask = proc.StandardOutput.ReadToEndAsync(ct);
         var stderrTask = proc.StandardError.ReadToEndAsync(ct);
         await proc.WaitForExitAsync(ct);

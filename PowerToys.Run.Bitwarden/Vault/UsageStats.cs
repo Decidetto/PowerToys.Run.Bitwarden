@@ -5,9 +5,7 @@ using Wox.Plugin.Logger;
 namespace PowerToys.Run.Bitwarden.Vault;
 
 // Per-item pick counter, persisted to disk. Items the user picks more often score
-// higher and float to the top of search results, including the empty-query case
-// where the match-score component is zero for everyone. Pure frequency, no recency
-// decay (keep it simple).
+// higher and float to the top of search results. Pure frequency, no recency decay.
 internal sealed class UsageStats : IDisposable
 {
     // Cap on the boost a single item can earn from pick frequency. Prevents a very

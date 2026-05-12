@@ -157,11 +157,39 @@ public class StateRefreshDecisionTests
     [Fact]
     public void InputIsPrefixOfKeyword_DoesNotMatch()
     {
-        // User typed "b" — not enough to be in our context yet.
+        // User typed "b", not enough to be in our context yet.
         var (refresh, _) = StateRefreshDecision.Decide(
             VaultState.Locked, hasBeenReady: false, hasFinishedInitialBoot: false,
             pendingUnlockQuery: null, currentPtRunInput: "b",
             actionKeyword: Keyword, defaultQuery: DefaultQuery);
         Assert.False(refresh);
+    }
+
+    // (5) Explicit user action refresh helper (`:sync`, `:lock` flow).
+
+    [Fact]
+    public void ExplicitAction_PtHidden_Refreshes()
+    {
+        // PT Run hides as soon as the result Action returns true, so on the explicit-action
+        // path the input is reliably null. Refresh anyway; the user was just here.
+        Assert.True(StateRefreshDecision.ShouldRefreshAfterExplicitAction(null, Keyword));
+    }
+
+    [Fact]
+    public void ExplicitAction_StillInOurContext_Refreshes()
+    {
+        Assert.True(StateRefreshDecision.ShouldRefreshAfterExplicitAction("bw :sync", Keyword));
+    }
+
+    [Fact]
+    public void ExplicitAction_MovedToOtherPlugin_DoesNotClobber()
+    {
+        Assert.False(StateRefreshDecision.ShouldRefreshAfterExplicitAction("calc 1+1", Keyword));
+    }
+
+    [Fact]
+    public void ExplicitAction_CaseInsensitive()
+    {
+        Assert.True(StateRefreshDecision.ShouldRefreshAfterExplicitAction("BW github", Keyword));
     }
 }

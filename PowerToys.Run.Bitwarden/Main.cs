@@ -72,7 +72,11 @@ public sealed class Main : IPlugin, IContextMenu, ISettingProvider, IDisposable
         switch (_session.State)
         {
             case VaultState.Ready:
-                return BuildSearchResults(searchText, icon);
+                // ':' prefix flips the query into command mode. Real vault item names can't
+                // start with ':' (the CLI strips/rejects it), so this is a safe sentinel.
+                return searchText.StartsWith(':')
+                    ? BuildCommandResults(searchText, icon)
+                    : BuildSearchResults(searchText, icon);
 
             case VaultState.Uninitialized:
             case VaultState.Initializing:
@@ -178,6 +182,89 @@ public sealed class Main : IPlugin, IContextMenu, ISettingProvider, IDisposable
             });
         }
         return results;
+    }
+
+    private List<Result> BuildCommandResults(string search, string icon)
+    {
+        var sub = search.AsSpan().TrimStart(':').Trim().ToString();
+        var results = new List<Result>();
+
+        if (sub.Length == 0 || "sync".StartsWith(sub, StringComparison.OrdinalIgnoreCase))
+        {
+            results.Add(new Result
+            {
+                Title = "Sync vault from server",
+                SubTitle = "Force-refresh the local cache from your Bitwarden account.",
+                IcoPath = icon,
+                Score = TopResultScore,
+                QueryTextDisplay = search,
+                Action = _ctx => { TriggerSync(); return true; },
+            });
+        }
+
+        if (sub.Length == 0 || "lock".StartsWith(sub, StringComparison.OrdinalIgnoreCase))
+        {
+            results.Add(new Result
+            {
+                Title = "Lock vault now",
+                SubTitle = "Re-lock immediately; master password will be required next time.",
+                IcoPath = icon,
+                Score = TopResultScore - 1,
+                QueryTextDisplay = search,
+                Action = _ctx => { TriggerLock(); return true; },
+            });
+        }
+
+        if (results.Count == 0)
+        {
+            results.Add(new Result
+            {
+                Title = $"No Bitwarden command matches \":{sub}\"",
+                SubTitle = "Try :sync",
+                IcoPath = icon,
+                QueryTextDisplay = search,
+            });
+        }
+        return results;
+    }
+
+    private void TriggerSync()
+    {
+        if (_session is null) return;
+        var api = _context?.API;
+        _ = Task.Run(async () =>
+        {
+            bool ok;
+            try { ok = await _session.SyncNowAsync(CancellationToken.None); }
+            catch (Exception ex)
+            {
+                Log.Exception("SyncNowAsync threw", ex, typeof(Main));
+                ok = false;
+            }
+            // Silent on success — PT Run already hid, and the next query renders fresh data.
+            // Only the failure path surfaces UI, and we accept the disruption because the
+            // /sync endpoint is the same one the periodic 15-min timer hits without issue,
+            // so a manual failure means something actually went wrong worth flagging.
+            if (ok || api is null) return;
+            Application.Current?.Dispatcher.BeginInvoke(new Action(() =>
+            {
+                try { api.ShowMsg("Bitwarden", "Sync failed. See PowerToys Run logs.", CurrentIcon); }
+                catch (Exception ex) { Log.Exception("ShowMsg after sync failure failed", ex, typeof(Main)); }
+            }));
+        });
+    }
+
+    private void TriggerLock()
+    {
+        if (_session is null) return;
+        _ = Task.Run(async () =>
+        {
+            // Fully silent — user can reopen PT Run to confirm the locked state from the
+            // first result. Errors go to logs, not UI: lock failures are rare and not
+            // actionable from this surface.
+            try { await _session.LockNowAsync(CancellationToken.None); }
+            catch (Exception ex) { Log.Exception("LockNowAsync threw", ex, typeof(Main)); }
+        });
     }
 
     public List<ContextMenuResult> LoadContextMenus(Result selectedResult)

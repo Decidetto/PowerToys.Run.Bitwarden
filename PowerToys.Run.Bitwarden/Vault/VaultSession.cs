@@ -175,6 +175,38 @@ internal sealed class VaultSession : IDisposable
         return "https://" + s;
     }
 
+    // User-triggered "force sync". Takes the gate so we can't race a reconfigure or unlock.
+    // The periodic timer skips the gate by design (best-effort background work), but a
+    // user-issued sync should be atomic from their point of view.
+    public async Task<bool> SyncNowAsync(CancellationToken ct)
+    {
+        Touch();
+        await _gate.WaitAsync(ct);
+        try
+        {
+            if (_state != VaultState.Ready || _client is null) return false;
+            var ok = await _client.SyncAsync(ct);
+            if (ok) await RefreshCacheAsync(ct);
+            return ok;
+        }
+        finally { _gate.Release(); }
+    }
+
+    // User-triggered explicit lock. Waits for the gate indefinitely (unlike auto-lock,
+    // which gives up after LockGateTimeout) — if the user said lock, we lock once nothing
+    // else is mid-flight. Returns true iff we actually transitioned Ready → Locked.
+    public async Task<bool> LockNowAsync(CancellationToken ct)
+    {
+        await _gate.WaitAsync(ct);
+        try
+        {
+            if (_state != VaultState.Ready) return false;
+            await LockHoldingGateAsync("user command (:lock)");
+            return true;
+        }
+        finally { _gate.Release(); }
+    }
+
     public async Task<string?> GetPasswordAsync(string id, CancellationToken ct)
     {
         Touch();
@@ -358,18 +390,23 @@ internal sealed class VaultSession : IDisposable
         // If something else holds the gate, that operation will leave the vault in its
         // own intended state; we don't need to stomp on it.
         if (!await _gate.WaitAsync(LockGateTimeout)) return;
-        try
-        {
-            if (_state != VaultState.Ready) return;
-            Log.Info($"Locking vault: {reason}", typeof(VaultSession));
-            if (_client is not null)
-            {
-                try { await _client.LockAsync(CancellationToken.None); }
-                catch (Exception ex) { Log.Exception("Lock POST failed", ex, typeof(VaultSession)); }
-            }
-            Transition(VaultState.Locked);
-        }
+        try { await LockHoldingGateAsync(reason); }
         finally { _gate.Release(); }
+    }
+
+    // Caller must already hold _gate. Centralises the lock POST + state transition so
+    // both auto/system-triggered (timeout-gated) and user-triggered (wait-indefinitely)
+    // entry points produce identical end states.
+    private async Task LockHoldingGateAsync(string reason)
+    {
+        if (_state != VaultState.Ready) return;
+        Log.Info($"Locking vault: {reason}", typeof(VaultSession));
+        if (_client is not null)
+        {
+            try { await _client.LockAsync(CancellationToken.None); }
+            catch (Exception ex) { Log.Exception("Lock POST failed", ex, typeof(VaultSession)); }
+        }
+        Transition(VaultState.Locked);
     }
 
     private void Touch() => _lastActivityUtc = DateTime.UtcNow;

@@ -1,38 +1,45 @@
-using PowerToys.Run.Bitwarden.Native;
+using System.Runtime.InteropServices;
 using System.Security;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
+using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Media.Effects;
 
 namespace PowerToys.Run.Bitwarden;
 
 // Frameless code-only WPF window styled to feel like part of the PowerToys Run
-// launcher instead of a standard Win32 dialog: no titlebar, rounded corners,
-// drop shadow, dark palette. Drag from anywhere on the panel.
+// launcher rather than a standard Win32 dialog: rounded corners, drop shadow,
+// dark palette.
 internal sealed class UnlockDialog : Window
 {
-    // Used to pre-center the dialog on the cursor monitor before WPF has computed
-    // ActualHeight; close enough to avoid a flash, then refined in Loaded.
-    private const double EstimatedDialogHeight = 240;
+    // HWND of PT Run's launcher, captured by the caller.
+    private readonly IntPtr _ptRunHwnd;
 
     private readonly PasswordBox _passwordBox = new();
     private readonly TextBlock _errorLabel = new();
     private readonly Button _unlockButton = new();
     private readonly Button _cancelButton = new();
     private bool _busy;
+    // Set in Closed so that an unlock in flight when the user hits Cancel/Escape doesn't
+    // touch controls on a closed Window after the await returns. Touching WPF controls
+    // post-close can throw, and an async-void Click handler would propagate the throw to
+    // the dispatcher's unhandled-exception path and crash PT Run.
+    private bool _isClosing;
 
     public Func<SecureString, Task<bool>>? OnUnlockRequested { get; set; }
 
-    public UnlockDialog()
+    public UnlockDialog(IntPtr ptRunHwnd = default)
     {
+        _ptRunHwnd = ptRunHwnd;
+
         Title = "Bitwarden - Unlock vault";
         Width = 380;
         SizeToContent = SizeToContent.Height;
-        // Manual + custom positioning so the dialog opens on the monitor the user is
-        // working on (cursor location) rather than the primary screen.
-        WindowStartupLocation = WindowStartupLocation.Manual;
+        // CenterScreen is the fallback. When we have PT Run's HWND, the Loaded handler
+        // below overrides via SetWindowPos with the right monitor + centering math.
+        WindowStartupLocation = WindowStartupLocation.CenterScreen;
         ResizeMode = ResizeMode.NoResize;
         WindowStyle = WindowStyle.None;
         AllowsTransparency = true;
@@ -130,25 +137,68 @@ internal sealed class UnlockDialog : Window
         Content = panel;
 
         _unlockButton.Click += async (_, _) => await TryUnlockAsync();
+        Closed += (_, _) => _isClosing = true;
 
-        // Pre-position before the window is shown to avoid a flash on the primary
-        // monitor; refine again after layout so the height-based centering uses
-        // the real ActualHeight rather than the rough estimate.
-        SourceInitialized += (_, _) => PositionOnCursorMonitor(estimatedHeight: EstimatedDialogHeight);
         Loaded += (_, _) =>
         {
-            PositionOnCursorMonitor(estimatedHeight: ActualHeight);
+            PositionOnPtRunMonitor();
             Activate();
             _passwordBox.Focus();
         };
     }
 
-    private void PositionOnCursorMonitor(double estimatedHeight)
+    // Horizontal: center on PT Run. Vertical: center on its monitor's work area.
+    // All math in physical pixels via Win32.
+    private void PositionOnPtRunMonitor()
     {
-        if (!MonitorHelper.TryGetWorkAreaUnderCursor(out var area)) return;
-        Left = area.Left + (area.Width - Width) / 2;
-        Top = area.Top + (area.Height - estimatedHeight) / 2;
+        if (_ptRunHwnd == IntPtr.Zero) return;
+        var ourHwnd = new WindowInteropHelper(this).Handle;
+        if (ourHwnd == IntPtr.Zero) return;
+
+        if (!GetWindowRect(_ptRunHwnd, out var ptRunPx)) return;
+        var hMon = MonitorFromWindow(_ptRunHwnd, MONITOR_DEFAULTTONEAREST);
+        if (hMon == IntPtr.Zero) return;
+        var mi = new MONITORINFO { cbSize = Marshal.SizeOf<MONITORINFO>() };
+        if (!GetMonitorInfo(hMon, ref mi)) return;
+        if (!GetWindowRect(ourHwnd, out var ourPx)) return;
+
+        var ourW = ourPx.Right - ourPx.Left;
+        var ourH = ourPx.Bottom - ourPx.Top;
+        var x = (ptRunPx.Left + ptRunPx.Right - ourW) / 2;
+        var y = (mi.rcWork.Top + mi.rcWork.Bottom - ourH) / 2;
+
+        SetWindowPos(ourHwnd, IntPtr.Zero, x, y, 0, 0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
     }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RECT { public int Left, Top, Right, Bottom; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MONITORINFO
+    {
+        public int cbSize;
+        public RECT rcMonitor;
+        public RECT rcWork;
+        public uint dwFlags;
+    }
+
+    private const uint MONITOR_DEFAULTTONEAREST = 2;
+    private const uint SWP_NOSIZE = 0x0001;
+    private const uint SWP_NOZORDER = 0x0004;
+    private const uint SWP_NOACTIVATE = 0x0010;
+
+    [DllImport("user32.dll")]
+    private static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint dwFlags);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFO lpmi);
+
+    [DllImport("user32.dll")]
+    private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
 
     private async Task TryUnlockAsync()
     {
@@ -164,24 +214,27 @@ internal sealed class UnlockDialog : Window
         try
         {
             // Run the unlock chain on a thread pool thread: bw unlock and bw serve spawn
-            // synchronously (Process.Start blocks until the child exists), and the await
-            // chain would otherwise run those sync steps on this dialog's UI thread.
+            // synchronously (Process.Start blocks until the child exists).
             var ok = await Task.Run(() => requested(password));
+            if (_isClosing) return;
             if (ok) { DialogResult = true; Close(); return; }
             _errorLabel.Text = "Unlock failed - wrong master password?";
         }
         catch (Exception ex)
         {
-            _errorLabel.Text = "Unlock error: " + ex.Message;
+            if (!_isClosing) _errorLabel.Text = "Unlock error: " + ex.Message;
         }
         finally
         {
             password.Dispose();
-            _passwordBox.Clear();
-            _busy = false;
-            _unlockButton.IsEnabled = true;
-            _unlockButton.Content = "Unlock";
-            _passwordBox.Focus();
+            if (!_isClosing)
+            {
+                _passwordBox.Clear();
+                _busy = false;
+                _unlockButton.IsEnabled = true;
+                _unlockButton.Content = "Unlock";
+                _passwordBox.Focus();
+            }
         }
     }
 }

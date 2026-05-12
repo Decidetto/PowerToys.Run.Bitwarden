@@ -7,6 +7,7 @@ using System.IO;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
+using System.Windows.Interop;
 using Wox.Plugin;
 using Wox.Plugin.Logger;
 
@@ -33,6 +34,9 @@ public sealed class Main : IPlugin, IContextMenu, ISettingProvider, IDisposable
     // Captured when the user invokes the Unlock prompt so we can put it right back into
     // their search after a successful unlock.
     private volatile string? _pendingUnlockQuery;
+    // Guard against rapid double-Enter on the Locked-state result stacking two modal
+    // dialogs; the second ShowDialog throws InvalidOperationException.
+    private volatile bool _unlockDialogOpen;
 
     public IEnumerable<PluginAdditionalOption> AdditionalOptions => _settings.BuildAdditionalOptions();
 
@@ -137,9 +141,6 @@ public sealed class Main : IPlugin, IContextMenu, ISettingProvider, IDisposable
         }
     }
 
-    // `search` is also used as QueryTextDisplay on each result. PT prepends the configured
-    // ActionKeyword to it, producing the same string the user already has in the input box,
-    // which suppresses PT's selection-driven Text rewrite and keeps the caret stable.
     private List<Result> BuildSearchResults(string search, string icon)
     {
         // Local copy so the lambda below captures a stable reference even if _session is
@@ -245,11 +246,14 @@ public sealed class Main : IPlugin, IContextMenu, ISettingProvider, IDisposable
                 Log.Exception("SyncNowAsync threw", ex, typeof(Main));
                 ok = false;
             }
-            // Silent on success — PT Run already hid, and the next query renders fresh data.
-            // Only the failure path surfaces UI, and we accept the disruption because the
-            // /sync endpoint is the same one the periodic 15-min timer hits without issue,
-            // so a manual failure means something actually went wrong worth flagging.
-            if (ok || api is null) return;
+            if (ok)
+            {
+                ForceRefreshAfterExplicitAction();
+                return;
+            }
+            // Failure path surfaces a popup because /sync hits the same endpoint the periodic
+            // 15-min timer hits without issue. A manual failure means something's broken.
+            if (api is null) return;
             Application.Current?.Dispatcher.BeginInvoke(new Action(() =>
             {
                 try { api.ShowMsg("Bitwarden", "Sync failed. See PowerToys Run logs.", CurrentIcon); }
@@ -263,12 +267,34 @@ public sealed class Main : IPlugin, IContextMenu, ISettingProvider, IDisposable
         if (_session is null) return;
         _ = Task.Run(async () =>
         {
-            // Fully silent — user can reopen PT Run to confirm the locked state from the
-            // first result. Errors go to logs, not UI: lock failures are rare and not
-            // actionable from this surface.
-            try { await _session.LockNowAsync(CancellationToken.None); }
-            catch (Exception ex) { Log.Exception("LockNowAsync threw", ex, typeof(Main)); }
+            bool locked;
+            try { locked = await _session.LockNowAsync(CancellationToken.None); }
+            catch (Exception ex)
+            {
+                Log.Exception("LockNowAsync threw", ex, typeof(Main));
+                locked = false;
+            }
+            // Refresh on success so the user reopening PT Run sees the Unlock prompt instead
+            // of stale results from the just-locked vault.
+            if (locked) ForceRefreshAfterExplicitAction();
         });
+    }
+
+    // After an explicit user action (`:sync` / `:lock`), force PT Run to re-render with
+    // current state. Skips the refresh if PT Run is somehow visible in another
+    // plugin's context, to avoid clobbering a query they've moved on to.
+    private void ForceRefreshAfterExplicitAction()
+    {
+        var api = _context?.API;
+        if (api is null) return;
+        var keyword = _context?.CurrentPluginMetadata?.ActionKeyword ?? string.Empty;
+        if (!StateRefreshDecision.ShouldRefreshAfterExplicitAction(TryReadCurrentPtRunInput(), keyword)) return;
+        var query = string.IsNullOrEmpty(keyword) ? string.Empty : keyword + " ";
+        Application.Current?.Dispatcher.BeginInvoke(new Action(() =>
+        {
+            try { api.ChangeQuery(query, requery: true); }
+            catch (Exception ex) { Log.Exception("Forced ChangeQuery after explicit action failed", ex, typeof(Main)); }
+        }));
     }
 
     public List<ContextMenuResult> LoadContextMenus(Result selectedResult)
@@ -317,16 +343,22 @@ public sealed class Main : IPlugin, IContextMenu, ISettingProvider, IDisposable
 
         if (diff.AuthChanged)
         {
+            // Reconfigure rebuilds the session and picks up all non-auth setting values
+            // along the way, so the per-setting Apply* calls below would be redundant.
             _ = Task.Run(async () =>
             {
                 try { await _session.ReconfigureAsync(_settings, CancellationToken.None); }
                 catch (Exception ex) { Log.Exception("ReconfigureAsync failed", ex, typeof(Main)); }
             });
+            return;
         }
-        else if (diff.AutoLockChanged)
+        if (diff.AutoLockChanged) _session.ApplyAutoLockSetting(incoming.AutoLockMinutes);
+        if (diff.UsageBoostChanged)
         {
-            // Lock-policy-only change: don't tear down bw serve, just resize the timer.
-            _session.ApplyAutoLockSetting(incoming.AutoLockMinutes);
+            _session.ApplyUsageBoostSetting(incoming.UsageBoostEnabled);
+            // Force a requery so the user sees the re-ranked list on next reopen instead of
+            // stale results that look like the toggle didn't take.
+            ForceRefreshAfterExplicitAction();
         }
     }
 
@@ -364,9 +396,7 @@ public sealed class Main : IPlugin, IContextMenu, ISettingProvider, IDisposable
 
     // Reads PT Run's input box, or null if the window is hidden or the control can't be
     // located. Used to gate forced requeries so background state transitions don't clobber
-    // the user's input when they've moved on to another plugin's context. IPublicAPI doesn't
-    // expose the current query, so we reach through PT Run's WPF tree (we run in its
-    // process). The TextBox name "QueryTextBox" is defined in PT Run's LauncherControl.xaml.
+    // the user's input when they've moved on to another plugin's context.
     private static string? TryReadCurrentPtRunInput()
     {
         var dispatcher = Application.Current?.Dispatcher;
@@ -397,20 +427,36 @@ public sealed class Main : IPlugin, IContextMenu, ISettingProvider, IDisposable
         // if _session is nulled by a concurrent Dispose between scheduling and invocation.
         var session = _session;
         if (dispatcher is null || session is null) return;
+        if (_unlockDialogOpen) return;
+        _unlockDialogOpen = true;
 
-        // BeginInvoke (not Invoke) so the Action delegate can return immediately and PT hides
-        // its window before the dialog is shown. Otherwise the modal pump runs under PT's UI.
+        // Kick off a sync now; the user is about to spend seconds typing their master
+        // password, which is free time to refresh the local store from the server. The
+        // unlock path awaits this before reading the cache, so the user sees fresh items
+        // when the vault opens.
+        session.StartBackgroundSync();
+
+        // Capture PT Run's HWND now.
+        var w = Application.Current?.MainWindow;
+        var ptRunHwnd = w is null ? IntPtr.Zero : new WindowInteropHelper(w).Handle;
+
+        // BeginInvoke so the Action delegate can return immediately and PT hides its window before the dialog is shown.
         dispatcher.BeginInvoke(new Action(() =>
         {
             try
             {
-                var dialog = new UnlockDialog
+                var dialog = new UnlockDialog(ptRunHwnd)
                 {
                     OnUnlockRequested = pw => session.UnlockWithPasswordAsync(pw, CancellationToken.None),
                 };
+                dialog.Closed += (_, _) => _unlockDialogOpen = false;
                 dialog.ShowDialog();
             }
-            catch (Exception ex) { Log.Exception("ShowUnlockDialog failed", ex, typeof(Main)); }
+            catch (Exception ex)
+            {
+                _unlockDialogOpen = false;
+                Log.Exception("ShowUnlockDialog failed", ex, typeof(Main));
+            }
         }));
     }
 

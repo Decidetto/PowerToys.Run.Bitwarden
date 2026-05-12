@@ -1,2 +1,113 @@
-# PowerToys.Run.Bitwarden
-Functional Bitwarden plugin for PowerToys Run
+# Bitwarden plugin for PowerToys Run
+
+Search your Bitwarden vault from PowerToys Run and copy passwords to the clipboard, without ever opening the app.
+
+Type the action keyword (default: `bw`) and start typing to find your desired website/account. Pick an item to copy its password to your clipboard. Auto-clears from the clipboard after 30 seconds.
+
+## Features
+
+- **Fast local search**: type `bw <query>` to fuzzy-match by item name or username. Results filter as you type.
+- **Enter copies the password**, hidden the entire time, never displayed on screen.
+- **Sub-actions** on each result:
+  - `Ctrl+C` — copy the item's username
+  - `Ctrl+O` — open the item's URL in your default browser
+- **Commands**:
+  - `bw :sync` — manually sync with the Bitwarden server
+  - `bw :lock` — lock the vault immediately
+- **Unlock** vault via a discreet dialog popup that obscures the characters of your master password.
+- **Auto-lock** after a configurable idle timeout (default 30 minutes; set to `0` to stay unlocked until PowerToys closes).
+  - Also locks vault automatically when Windows locks the session or you disconnect from an RDP session.
+- **Pick-frequency ranking** (optional): items you copy often float to the top of results. Toggle in settings.
+- **Bitwarden US/EU / Self-hosted / Vaultwarden** all supported. Type your server URL in the settings.
+
+## Security
+
+- **Master password is never stored.** Entered on demand into a `PasswordBox` (no plaintext in `settings.json`, no DPAPI sidecar), used once, then zeroed.
+- **API credentials** (client ID + secret) are stored in PowerToys Run's settings. They authenticate to the server but do not decrypt anything; the vault stays locked until you enter the master password.
+- **Copied passwords auto-clear from the clipboard after 30 seconds.**
+- **Passwords are excluded from Win+V clipboard history and cloud-clipboard sync**
+- **Vault re-locks** on Windows session lock, console disconnect, or RDP disconnect.
+
+## Requirements
+
+- Windows 10/11
+- [PowerToys](https://github.com/microsoft/PowerToys) with PowerToys Run enabled
+- [Bitwarden CLI](https://bitwarden.com/help/cli/) (`bw.exe` on `PATH`, or set a custom path in plugin settings). Must be installed separately
+- API credentials for your vault
+
+## Installation
+
+1. Download `Bitwarden-v<version>-x64.zip` (or `-arm64.zip` for ARM64 Windows) from the [Releases](../../releases) page.
+2. Extract the `Bitwarden\` folder into:
+   ```
+   %LOCALAPPDATA%\Microsoft\PowerToys\PowerToys Run\Plugins\
+   ```
+3. Restart PowerToys.
+4. Open PowerToys Settings → PowerToys Run → Bitwarden, and fill in the settings below.
+
+## Setting up your API key
+
+Bitwarden lets you authenticate the CLI without your master password by using a personal API key:
+
+1. Sign in to the web vault at [vault.bitwarden.com](https://vault.bitwarden.com) (or your self-hosted address).
+2. Go to **Account Settings → Security → Keys**.
+3. Click **View API key**, confirm with your master password.
+4. Copy the `client_id` and `client_secret` values.
+5. Paste them into the plugin's settings in PowerToys Run.
+
+The master password still controls *unlocking* the vault. You'll be prompted for it the first time you search after a restart or auto-lock.
+
+## Settings
+
+| Setting | Default | Notes |
+|---|---|---|
+| **Server URL** | empty | Leave empty for `bitwarden.com`. Set to your Vaultwarden / self-hosted URL otherwise. Accepts bare hosts like `bitwarden.eu`. |
+| **API client_id** | - | From web vault → Account Settings → Security → Keys. |
+| **API client_secret** | - | The matching secret. |
+| **Auto-lock after (minutes)** | 30 | `0` = stay unlocked until PowerToys closes. Range 0–1440. |
+| **Rank results by pick frequency** | on | Items you've copied more often float to the top. |
+| **Bitwarden CLI path (advanced)** | empty | Optional override. Leave empty to resolve `bw.exe` from `PATH`. |
+
+## Usage
+
+### First run
+
+Open PowerToys Run, type `bw`. You'll see the plugin starting up briefly while it warms up the Bitwarden CLI in the background. Once ready, you'll be prompted for your master password the first time you actually search.
+
+### Searching
+
+```
+bw github       → items matching "github" by name or username
+bw              → top results by pick frequency (most-used items)
+```
+
+Press Enter on a result → password copied, launcher closes.
+
+### Commands
+
+```
+bw :sync        → force-refresh the local cache from the server
+bw :lock        → lock the vault immediately
+```
+
+### Context actions
+
+Hover or arrow-key to a result, then:
+
+- `Ctrl+C` → copy the username instead of the password
+- `Ctrl+O` → open the item's first URL in your default browser
+
+## Scope
+
+Currently supported:
+
+- ✅ Login items (passwords + usernames + URLs)
+- ❌ TOTP codes
+- ❌ Secure notes, identities, payment cards
+- ❌ Item creation / editing / deletion
+- ❌ Biometric / Windows Hello unlock
+
+## Acknowledgements
+
+- The [Bitwarden CLI](https://bitwarden.com/help/cli/) does all the heavy lifting; this plugin is a thin search-and-clipboard layer over it.
+- Built on the [Community.PowerToys.Run.Plugin.Dependencies](https://www.nuget.org/packages/Community.PowerToys.Run.Plugin.Dependencies) package.

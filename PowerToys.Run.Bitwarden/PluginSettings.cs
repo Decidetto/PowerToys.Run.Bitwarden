@@ -7,9 +7,10 @@ internal sealed record PluginSettings(
     string ClientId,
     string ClientSecret,
     int AutoLockMinutes,
-    string? BwExePathOverride)
+    string? BwExePathOverride,
+    bool UsageBoostEnabled)
 {
-    public static readonly PluginSettings Empty = new(null, "", "", 30, null);
+    public static readonly PluginSettings Empty = new(null, "", "", 30, null, UsageBoostEnabled: true);
 
     public IEnumerable<PluginAdditionalOption> BuildAdditionalOptions() => new[]
     {
@@ -52,6 +53,14 @@ internal sealed record PluginSettings(
         },
         new PluginAdditionalOption
         {
+            Key = nameof(UsageBoostEnabled),
+            DisplayLabel = "Rank results by pick frequency",
+            DisplayDescription = "Items that are selected more often float to the top.",
+            PluginOptionType = PluginAdditionalOption.AdditionalOptionType.Checkbox,
+            Value = UsageBoostEnabled,
+        },
+        new PluginAdditionalOption
+        {
             Key = nameof(BwExePathOverride),
             DisplayLabel = "Bitwarden CLI path (advanced)",
             DisplayDescription = "Optional override. Leave empty to resolve 'bw' / 'bw.exe' from PATH.",
@@ -69,10 +78,11 @@ internal sealed record PluginSettings(
             ClientId:            StringOrEmpty(map, nameof(ClientId)),
             ClientSecret:        StringOrEmpty(map, nameof(ClientSecret)),
             AutoLockMinutes:     NumberOr(map, nameof(AutoLockMinutes), 30),
-            BwExePathOverride:   StringOrNull(map, nameof(BwExePathOverride)));
+            BwExePathOverride:   StringOrNull(map, nameof(BwExePathOverride)),
+            UsageBoostEnabled:   BoolOr(map, nameof(UsageBoostEnabled), dflt: true));
     }
 
-    public readonly record struct Difference(bool AuthChanged, bool AutoLockChanged);
+    public readonly record struct Difference(bool AuthChanged, bool AutoLockChanged, bool UsageBoostChanged);
 
     public static Difference Diff(PluginSettings prev, PluginSettings next)
     {
@@ -85,7 +95,8 @@ internal sealed record PluginSettings(
             prev.ClientSecret != next.ClientSecret ||
             prev.BwExePathOverride != next.BwExePathOverride;
         var autoLockChanged = prev.AutoLockMinutes != next.AutoLockMinutes;
-        return new Difference(authChanged, autoLockChanged);
+        var usageBoostChanged = prev.UsageBoostEnabled != next.UsageBoostEnabled;
+        return new Difference(authChanged, autoLockChanged, usageBoostChanged);
     }
 
     private static string? StringOrNull(Dictionary<string, PluginAdditionalOption> m, string k)
@@ -96,4 +107,7 @@ internal sealed record PluginSettings(
 
     private static int NumberOr(Dictionary<string, PluginAdditionalOption> m, string k, int dflt)
         => m.TryGetValue(k, out var v) ? (int)v.NumberValue : dflt;
+
+    private static bool BoolOr(Dictionary<string, PluginAdditionalOption> m, string k, bool dflt)
+        => m.TryGetValue(k, out var v) ? v.Value : dflt;
 }

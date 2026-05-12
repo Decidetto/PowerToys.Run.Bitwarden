@@ -10,7 +10,7 @@ internal sealed class VaultSession : IDisposable
 {
     // AutoLockMinutes <= this value means "never auto-lock", so we skip the timer entirely.
     public const int AutoLockDisabledValue = 0;
-    // Cap on results we render. Search() and Main both honour it via MaxRenderedResults.
+    // Cap on results we render.
     public const int MaxRenderedResults = 20;
 
     private static readonly TimeSpan AutoLockCheckPeriod = TimeSpan.FromMinutes(1);
@@ -30,13 +30,15 @@ internal sealed class VaultSession : IDisposable
     private readonly SemaphoreSlim _gate = new(1, 1);
     private readonly UsageStats _usage;
 
-    // null! is set during InitializeAsync → BuildSessionAsync before any other code touches it.
-    private BitwardenCli _cli = null!;
     private BitwardenServeProcess? _serve;
     private BitwardenClient? _client;
     private PluginSettings _settings = PluginSettings.Empty;
     private System.Threading.Timer? _autoLockTimer;
     private System.Threading.Timer? _syncTimer;
+    // Holds an in-flight pre-unlock sync kicked off when the user clicked Unlock. The
+    // unlock path awaits this before refreshing the cache, so the user sees fresh data
+    // when the vault opens.
+    private Task? _pendingSync;
     private DateTime _lastActivityUtc = DateTime.UtcNow;
     private volatile VaultState _state = VaultState.Uninitialized;
     // Reference swap is atomic on the CLR. Readers always see a fully populated list.
@@ -85,12 +87,16 @@ internal sealed class VaultSession : IDisposable
     public void ApplyAutoLockSetting(int autoLockMinutes)
     {
         _settings = _settings with { AutoLockMinutes = autoLockMinutes };
-        // Recreate the auto-lock timer if we're in a state that has one.
         if (_state == VaultState.Ready)
         {
             StopAutoLockTimer();
             StartAutoLockTimer();
         }
+    }
+
+    public void ApplyUsageBoostSetting(bool enabled)
+    {
+        _settings = _settings with { UsageBoostEnabled = enabled };
     }
 
     public async Task<bool> UnlockWithPasswordAsync(SecureString password, CancellationToken ct)
@@ -99,19 +105,30 @@ internal sealed class VaultSession : IDisposable
         await _gate.WaitAsync(ct);
         try
         {
-            // bw serve is pre-warmed at Init, so we always have a running daemon to talk to;
-            // unlocking is a single localhost round-trip plus the cache refresh.
+            // bw serve is pre-warmed at Init, so we always have a running daemon to talk to.
             if (_client is null)
             {
                 LastError = "bw serve is not running. Try toggling a setting to reconfigure.";
                 return false;
             }
 
+            LastError = null;
             var ok = await _client.UnlockAsync(password, ct);
             if (!ok) { LastError = "Wrong master password."; return false; }
 
-            await RefreshCacheAsync(ct);
-            StartSyncTimer();
+            // Wait for any running pre-unlock background sync to finish before refreshing.
+            var pending = _pendingSync;
+            _pendingSync = null;
+            if (pending is not null) await pending;
+
+            if (!await RefreshCacheAsync(ct))
+            {
+                LastError = "Vault unlocked but failed to load items. See PowerToys Run logs.";
+                // Re-lock to keep our state and bw serve's state coherent.
+                try { await _client.LockAsync(ct); }
+                catch (Exception ex) { Log.Exception("Re-lock after refresh failure failed", ex, typeof(VaultSession)); }
+                return false;
+            }
             Transition(VaultState.Ready);
             return true;
         }
@@ -132,12 +149,16 @@ internal sealed class VaultSession : IDisposable
         // Score = relevance (match strength) + pick-frequency boost (capped). For
         // empty queries the relevance is zero for everyone, so frequency alone
         // determines order: heavily-used items rise to the top, ties sort A→Z.
+        // With the boost setting off, score is pure relevance and empty-query results
+        // come back alphabetical.
+        var useBoost = _settings.UsageBoostEnabled;
         var scored = new List<(VaultEntry Entry, int Score)>(capacity: cache.Count);
         foreach (var entry in cache)
         {
             var match = emptyQuery ? 0 : ScoreMatch(entry, q);
             if (!emptyQuery && match == 0) continue;
-            scored.Add((entry, match + _usage.GetBoost(entry.Id)));
+            var boost = useBoost ? _usage.GetBoost(entry.Id) : 0;
+            scored.Add((entry, match + boost));
         }
 
         return scored
@@ -175,9 +196,23 @@ internal sealed class VaultSession : IDisposable
         return "https://" + s;
     }
 
+    // Fire-and-forget sync, kicked off when the user opens the Unlock dialog.
+    // UnlockWithPasswordAsync awaits this before reading the cache.
+    public void StartBackgroundSync()
+    {
+        var client = _client;
+        if (client is null) return;
+        var existing = _pendingSync;
+        if (existing is not null && !existing.IsCompleted) return;
+
+        _pendingSync = Task.Run(async () =>
+        {
+            try { await client.SyncAsync(CancellationToken.None); }
+            catch (Exception ex) { Log.Exception("Pre-unlock background sync failed", ex, typeof(VaultSession)); }
+        });
+    }
+
     // User-triggered "force sync". Takes the gate so we can't race a reconfigure or unlock.
-    // The periodic timer skips the gate by design (best-effort background work), but a
-    // user-issued sync should be atomic from their point of view.
     public async Task<bool> SyncNowAsync(CancellationToken ct)
     {
         Touch();
@@ -186,15 +221,14 @@ internal sealed class VaultSession : IDisposable
         {
             if (_state != VaultState.Ready || _client is null) return false;
             var ok = await _client.SyncAsync(ct);
-            if (ok) await RefreshCacheAsync(ct);
+            if (ok) ok = await RefreshCacheAsync(ct);
             return ok;
         }
         finally { _gate.Release(); }
     }
 
-    // User-triggered explicit lock. Waits for the gate indefinitely (unlike auto-lock,
-    // which gives up after LockGateTimeout) — if the user said lock, we lock once nothing
-    // else is mid-flight. Returns true iff we actually transitioned Ready → Locked.
+    // User-triggered explicit lock. Waits for the gate indefinitely; if the user said lock,
+    // we lock once nothing else is mid-flight. Returns true iff we actually transitioned Ready → Locked.
     public async Task<bool> LockNowAsync(CancellationToken ct)
     {
         await _gate.WaitAsync(ct);
@@ -214,9 +248,8 @@ internal sealed class VaultSession : IDisposable
         try
         {
             var pw = await _client.GetPasswordAsync(id, ct);
-            // Count the pick only when a real password came back; failures shouldn't
-            // bias future ranking.
-            if (!string.IsNullOrEmpty(pw)) _usage.Increment(id);
+            // Count the pick only when a real password came back and only when usage-based ranking is on.
+            if (!string.IsNullOrEmpty(pw) && _settings.UsageBoostEnabled) _usage.Increment(id);
             return pw;
         }
         catch (Exception ex)
@@ -230,8 +263,8 @@ internal sealed class VaultSession : IDisposable
     {
         try
         {
-            _cli = new BitwardenCli(_settings.BwExePathOverride);
-            if (!_cli.IsAvailable())
+            var cli = new BitwardenCli(_settings.BwExePathOverride);
+            if (!cli.IsAvailable())
             {
                 LastError = "Bitwarden CLI ('bw') not found on PATH.";
                 Transition(VaultState.BwMissing);
@@ -239,9 +272,9 @@ internal sealed class VaultSession : IDisposable
             }
 
             if (!string.IsNullOrWhiteSpace(_settings.ServerUrl))
-                await _cli.ConfigServerAsync(NormalizeServerUrl(_settings.ServerUrl!), ct);
+                await cli.ConfigServerAsync(NormalizeServerUrl(_settings.ServerUrl!), ct);
 
-            var status = await _cli.StatusAsync(ct);
+            var status = await cli.StatusAsync(ct);
             if (status == BwStatus.Unauthenticated)
             {
                 if (string.IsNullOrEmpty(_settings.ClientId) || string.IsNullOrEmpty(_settings.ClientSecret))
@@ -250,7 +283,7 @@ internal sealed class VaultSession : IDisposable
                     Transition(VaultState.LoggedOut);
                     return;
                 }
-                var ok = await _cli.LoginApiKeyAsync(_settings.ClientId, _settings.ClientSecret, ct);
+                var ok = await cli.LoginApiKeyAsync(_settings.ClientId, _settings.ClientSecret, ct);
                 if (!ok)
                 {
                     LastError = "Login failed - verify your API credentials.";
@@ -260,10 +293,8 @@ internal sealed class VaultSession : IDisposable
             }
 
             // Pre-warm bw serve so the user-triggered unlock is just one HTTP round-trip
-            // instead of waiting for two Node-based subprocesses to cold-start. The daemon
-            // boots in "locked" state from the CLI's persisted login; POST /unlock will
-            // move it to "unlocked" later.
-            _serve = new BitwardenServeProcess(_cli.ExePath);
+            // instead of waiting for two Node-based subprocesses to cold-start.
+            _serve = new BitwardenServeProcess(cli.ExePath);
             _serve.Start();
             _client = new BitwardenClient(_serve.BaseUri);
             if (!await WaitForServeReadyAsync(ct))
@@ -277,15 +308,15 @@ internal sealed class VaultSession : IDisposable
         }
         catch (Exception ex)
         {
-            LastError = ex.Message;
+            // Avoid surfacing raw exception text through the Failed-state SubTitle.
+            // The full exception goes to the log.
+            LastError = "Failed to initialize bw serve. See PowerToys Run logs.";
             Log.Exception("BuildSessionAsync failed", ex, typeof(VaultSession));
             Transition(VaultState.Failed);
         }
     }
 
-    // Polls /status with exponential backoff until the daemon answers anything other than
-    // "unreachable". Any successful response (locked, unlocked, unauthenticated) means
-    // bw serve is up and accepting requests.
+    // Polls /status with exponential backoff until the daemon answers anything other than "unreachable".
     private async Task<bool> WaitForServeReadyAsync(CancellationToken ct)
     {
         if (_client is null) return false;
@@ -302,9 +333,11 @@ internal sealed class VaultSession : IDisposable
         return false;
     }
 
-    private async Task RefreshCacheAsync(CancellationToken ct)
+    // Returns true on success, false if listing failed (already logged). Callers on the
+    // unlock and user-sync paths react to false; the periodic background timer ignores it.
+    private async Task<bool> RefreshCacheAsync(CancellationToken ct)
     {
-        if (_client is null) return;
+        if (_client is null) return false;
         try
         {
             var items = await _client.ListItemsAsync(ct);
@@ -316,16 +349,19 @@ internal sealed class VaultSession : IDisposable
                 .ToList();
             _itemsCache = fresh;
             Log.Info($"Vault cache refreshed: {fresh.Count} login items.", typeof(VaultSession));
+            return true;
         }
         catch (Exception ex)
         {
             Log.Exception("RefreshCacheAsync failed", ex, typeof(VaultSession));
+            return false;
         }
     }
 
     private void StartSyncTimer()
     {
-        _syncTimer ??= new System.Threading.Timer(async _ =>
+        StopSyncTimer();
+        _syncTimer = new System.Threading.Timer(async _ =>
         {
             try
             {
@@ -337,9 +373,14 @@ internal sealed class VaultSession : IDisposable
         }, null, SyncPeriod, SyncPeriod);
     }
 
+    private void StopSyncTimer()
+    {
+        _syncTimer?.Dispose();
+        _syncTimer = null;
+    }
+
     private void StartAutoLockTimer()
     {
-        // Belt-and-braces: never end up with two live timers.
         StopAutoLockTimer();
 
         if (_settings.AutoLockMinutes <= AutoLockDisabledValue)
@@ -420,11 +461,15 @@ internal sealed class VaultSession : IDisposable
             // Anchor the idle clock to the moment we became usable.
             _lastActivityUtc = DateTime.UtcNow;
             StartAutoLockTimer();
+            StartSyncTimer();
         }
         else
         {
-            // No reason to keep ticking when there's nothing to lock.
+            // No reason to keep either timer ticking: there's nothing to auto-lock, and
+            // no point pulling fresh vault data the user can't read while it's locked.
+            // The freshness gap is closed by syncing at unlock time (see UnlockWithPasswordAsync).
             StopAutoLockTimer();
+            StopSyncTimer();
         }
 
         if (prev != next)
@@ -438,7 +483,10 @@ internal sealed class VaultSession : IDisposable
     private void DisposeRuntime()
     {
         StopAutoLockTimer();
-        _syncTimer?.Dispose(); _syncTimer = null;
+        StopSyncTimer();
+        // Don't await the pending sync it's fire-and-forget; if it's still running it'll
+        // throw against the disposed _client below and be swallowed by its own try/catch.
+        _pendingSync = null;
         _client?.Dispose(); _client = null;
         _serve?.Dispose(); _serve = null;
         _itemsCache = null;

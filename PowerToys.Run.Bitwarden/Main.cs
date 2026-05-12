@@ -142,7 +142,11 @@ public sealed class Main : IPlugin, IContextMenu, ISettingProvider, IDisposable
     // which suppresses PT's selection-driven Text rewrite and keeps the caret stable.
     private List<Result> BuildSearchResults(string search, string icon)
     {
-        var entries = _session!.Search(search);
+        // Local copy so the lambda below captures a stable reference even if _session is
+        // nulled out by a concurrent Dispose. Worst case is a method call on a disposed
+        // session (caught by the inner Task.Run try) rather than an NRE on field access.
+        var session = _session!;
+        var entries = session.Search(search);
         if (entries.Count == 0)
         {
             return [ new Result
@@ -174,7 +178,7 @@ public sealed class Main : IPlugin, IContextMenu, ISettingProvider, IDisposable
                 {
                     _ = Task.Run(async () =>
                     {
-                        var pw = await _session.GetPasswordAsync(e.Id, CancellationToken.None);
+                        var pw = await session.GetPasswordAsync(e.Id, CancellationToken.None);
                         if (!string.IsNullOrEmpty(pw)) SecureClipboard.SetText(pw!);
                     });
                     return true;
@@ -330,36 +334,25 @@ public sealed class Main : IPlugin, IContextMenu, ISettingProvider, IDisposable
     {
         if (newState == VaultState.Ready) _hasBeenReady = true;
 
-        // Three refresh triggers, all driven by the same staleness problem:
-        // (a) initial boot finishing -> replace "starting up…" with whatever's next;
-        // (b) Locked → Ready (just unlocked) -> replace the "Unlock" prompt with results;
-        // (c) Ready → Locked (auto-lock fired) -> clear the now-stale account list.
-        var initialBootCompleting =
-            !_hasFinishedInitialBoot && newState is not (VaultState.Uninitialized or VaultState.Initializing);
-        if (initialBootCompleting) _hasFinishedInitialBoot = true;
-
-        var unlocked = newState == VaultState.Ready;
-        var lockingFromReady = newState == VaultState.Locked && _hasBeenReady;
-        if (!initialBootCompleting && !unlocked && !lockingFromReady) return;
-
         var api = _context?.API;
         if (api is null) return;
-        var keyword = _context?.CurrentPluginMetadata?.ActionKeyword;
+
+        var keyword = _context?.CurrentPluginMetadata?.ActionKeyword ?? string.Empty;
         var defaultQuery = string.IsNullOrEmpty(keyword) ? string.Empty : keyword + " ";
 
-        // After unlock, prefer the query the user had typed before the prompt so their
-        // search context survives the unlock detour.
-        string newQuery;
         var pending = _pendingUnlockQuery;
-        if (unlocked && !string.IsNullOrEmpty(pending))
-        {
-            newQuery = pending!;
-        }
-        else
-        {
-            newQuery = defaultQuery;
-        }
         _pendingUnlockQuery = null;
+
+        // Decide BEFORE updating _hasFinishedInitialBoot; the helper distinguishes the
+        // initial-boot transition by reading the prior value of that flag.
+        var (refresh, newQuery) = StateRefreshDecision.Decide(
+            newState, _hasBeenReady, _hasFinishedInitialBoot,
+            pending, TryReadCurrentPtRunInput(), keyword, defaultQuery);
+
+        if (!_hasFinishedInitialBoot && newState is not (VaultState.Uninitialized or VaultState.Initializing))
+            _hasFinishedInitialBoot = true;
+
+        if (!refresh) return;
 
         // BeginInvoke on the dispatcher so we don't block the state-transition path.
         Application.Current?.Dispatcher.BeginInvoke(new Action(() =>
@@ -369,10 +362,41 @@ public sealed class Main : IPlugin, IContextMenu, ISettingProvider, IDisposable
         }));
     }
 
+    // Reads PT Run's input box, or null if the window is hidden or the control can't be
+    // located. Used to gate forced requeries so background state transitions don't clobber
+    // the user's input when they've moved on to another plugin's context. IPublicAPI doesn't
+    // expose the current query, so we reach through PT Run's WPF tree (we run in its
+    // process). The TextBox name "QueryTextBox" is defined in PT Run's LauncherControl.xaml.
+    private static string? TryReadCurrentPtRunInput()
+    {
+        var dispatcher = Application.Current?.Dispatcher;
+        if (dispatcher is null) return null;
+        if (!dispatcher.CheckAccess()) return dispatcher.Invoke(TryReadCurrentPtRunInput);
+        var mainWindow = Application.Current?.MainWindow;
+        if (mainWindow is null || !mainWindow.IsVisible) return null;
+        return FindVisualDescendant<TextBox>(mainWindow, "QueryTextBox")?.Text;
+    }
+
+    private static T? FindVisualDescendant<T>(DependencyObject root, string name) where T : FrameworkElement
+    {
+        var count = System.Windows.Media.VisualTreeHelper.GetChildrenCount(root);
+        for (var i = 0; i < count; i++)
+        {
+            var child = System.Windows.Media.VisualTreeHelper.GetChild(root, i);
+            if (child is T t && t.Name == name) return t;
+            var found = FindVisualDescendant<T>(child, name);
+            if (found is not null) return found;
+        }
+        return null;
+    }
+
     private void ShowUnlockDialog()
     {
         var dispatcher = Application.Current?.Dispatcher;
-        if (dispatcher is null || _session is null) return;
+        // Local copy so the dialog's OnUnlockRequested lambda holds a stable reference even
+        // if _session is nulled by a concurrent Dispose between scheduling and invocation.
+        var session = _session;
+        if (dispatcher is null || session is null) return;
 
         // BeginInvoke (not Invoke) so the Action delegate can return immediately and PT hides
         // its window before the dialog is shown. Otherwise the modal pump runs under PT's UI.
@@ -382,7 +406,7 @@ public sealed class Main : IPlugin, IContextMenu, ISettingProvider, IDisposable
             {
                 var dialog = new UnlockDialog
                 {
-                    OnUnlockRequested = pw => _session.UnlockWithPasswordAsync(pw, CancellationToken.None),
+                    OnUnlockRequested = pw => session.UnlockWithPasswordAsync(pw, CancellationToken.None),
                 };
                 dialog.ShowDialog();
             }

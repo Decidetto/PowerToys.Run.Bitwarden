@@ -30,7 +30,8 @@ internal sealed class VaultSession : IDisposable
     private readonly SemaphoreSlim _gate = new(1, 1);
     private readonly UsageStats _usage;
 
-    private IBitwardenCli _cli;
+    // null! is set during InitializeAsync → BuildSessionAsync before any other code touches it.
+    private BitwardenCli _cli = null!;
     private BitwardenServeProcess? _serve;
     private BitwardenClient? _client;
     private PluginSettings _settings = PluginSettings.Empty;
@@ -49,7 +50,6 @@ internal sealed class VaultSession : IDisposable
 
     public VaultSession(string dataDir)
     {
-        _cli = new BitwardenCli(overridePath: null);
         _usage = new UsageStats(Path.Combine(dataDir, "usage.json"));
         SystemEvents.SessionSwitch += OnWindowsSessionSwitch;
         _sessionSwitchSubscribed = true;
@@ -81,7 +81,7 @@ internal sealed class VaultSession : IDisposable
         finally { _gate.Release(); }
     }
 
-    // Lock-policy-only update. N need to log out or restart bw serve.
+    // Lock-policy-only update. No need to log out or restart bw serve.
     public void ApplyAutoLockSetting(int autoLockMinutes)
     {
         _settings = _settings with { AutoLockMinutes = autoLockMinutes };
@@ -307,7 +307,7 @@ internal sealed class VaultSession : IDisposable
         if (_client is null) return;
         try
         {
-            var items = await _client.ListItemsAsync(string.Empty, ct);
+            var items = await _client.ListItemsAsync(ct);
             var fresh = items
                 .Where(i => i.Type == 1 && i.DeletedDate is null)
                 .Select(i => new VaultEntry(

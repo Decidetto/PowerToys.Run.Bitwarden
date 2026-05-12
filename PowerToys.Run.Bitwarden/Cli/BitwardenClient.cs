@@ -35,12 +35,9 @@ internal sealed class BitwardenClient : IDisposable
         }
     }
 
-    public async Task<ItemSummary[]> ListItemsAsync(string search, CancellationToken ct)
+    public async Task<ItemSummary[]> ListItemsAsync(CancellationToken ct)
     {
-        var path = string.IsNullOrEmpty(search)
-            ? "list/object/items"
-            : $"list/object/items?search={Uri.EscapeDataString(search)}";
-        var env = await _http.GetFromJsonAsync<Envelope<ListData<ItemSummary>>>(path, JsonOptions, ct);
+        var env = await _http.GetFromJsonAsync<Envelope<ListData<ItemSummary>>>("list/object/items", JsonOptions, ct);
         return env?.Data?.Data ?? [];
     }
 

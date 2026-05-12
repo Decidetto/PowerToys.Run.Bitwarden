@@ -5,7 +5,7 @@ using Wox.Plugin.Logger;
 
 namespace PowerToys.Run.Bitwarden.Cli;
 
-internal sealed class BitwardenCli : IBitwardenCli
+internal sealed class BitwardenCli
 {
     // Env var names the bw CLI itself recognises
     private const string ClientIdEnvVar = "BW_CLIENTID";

@@ -1,0 +1,13 @@
+{
+  "ID": "7B8F2D4A6E1C9F3B5D8A0E2C4F6B8D1A",
+  "ActionKeyword": "bw",
+  "IsGlobal": false,
+  "Name": "Bitwarden",
+  "Author": "Decidetto",
+  "Version": "0.1.0",
+  "Language": "csharp",
+  "Website": "https://bitwarden.com/",
+  "ExecuteFileName": "PowerToys.Run.Bitwarden.dll",
+  "IcoPathDark": "Images\\Bitwarden.dark.png",
+  "IcoPathLight": "Images\\Bitwarden.light.png"
+}

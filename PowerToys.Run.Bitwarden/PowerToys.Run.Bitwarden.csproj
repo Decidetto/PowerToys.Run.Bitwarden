@@ -1,0 +1,53 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net9.0-windows10.0.22621.0</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <Platforms>x64</Platforms>
+    <PlatformTarget>x64</PlatformTarget>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>PowerToys.Run.Bitwarden</AssemblyName>
+    <RootNamespace>PowerToys.Run.Bitwarden</RootNamespace>
+    <Version>0.1.0</Version>
+    <NoWarn>CA1416</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- PT supplies these assemblies at runtime; ExcludeAssets="runtime" keeps them out of
+         our plugin folder, while the compile-time references are still available. -->
+    <PackageReference Include="Community.PowerToys.Run.Plugin.Dependencies" Version="0.97.0" ExcludeAssets="runtime" />
+    <!-- For SystemEvents.SessionSwitch (relock on Windows lock screen / RDP disconnect). -->
+    <PackageReference Include="Microsoft.Win32.SystemEvents" Version="9.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="PowerToys.Run.Bitwarden.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="plugin.json">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="Images\**\*.png">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+  <!-- The Dependencies pkg's .props file uses bare <Reference> items that neither
+       <Reference Update Private="false"> nor ExcludeAssets="runtime" override.
+       Post-build delete keeps our plugin folder version-pinned to whatever PT supplies
+       at runtime instead of shipping our own (possibly drifting) copies. -->
+  <Target Name="StripPowerToysAssembliesFromOutput" AfterTargets="Build">
+    <ItemGroup>
+      <_PtHostAssemblies Include="$(OutputPath)PowerToys.Common.UI.*" />
+      <_PtHostAssemblies Include="$(OutputPath)PowerToys.ManagedCommon.*" />
+      <_PtHostAssemblies Include="$(OutputPath)PowerToys.Settings.UI.Lib.*" />
+      <_PtHostAssemblies Include="$(OutputPath)Wox.Infrastructure.*" />
+      <_PtHostAssemblies Include="$(OutputPath)Wox.Plugin.*" />
+    </ItemGroup>
+    <Delete Files="@(_PtHostAssemblies)" />
+  </Target>
+
+</Project>

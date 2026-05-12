@@ -1,0 +1,20 @@
+# Build outputs
+**/bin/
+**/obj/
+
+# Visual Studio / Rider / VS Code workspace state
+.vs/
+.idea/
+.vscode/
+*.user
+*.suo
+
+# Test results
+[Tt]est[Rr]esult*/
+
+# Claude local state
+.claude/
+
+# OS metadata
+Thumbs.db
+.DS_Store

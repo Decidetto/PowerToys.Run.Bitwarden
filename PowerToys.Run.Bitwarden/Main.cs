@@ -316,8 +316,10 @@ public sealed class Main : IPlugin, IContextMenu, ISettingProvider, IDisposable
             });
         }
 
-        if (!string.IsNullOrEmpty(entry.FirstUri))
+        if (entry.Uris.Count > 0)
         {
+            // First URL = the canonical/primary one per Bitwarden's own ordering.
+            var url = entry.Uris[0];
             menu.Add(new ContextMenuResult
             {
                 PluginName = Name,
@@ -326,7 +328,7 @@ public sealed class Main : IPlugin, IContextMenu, ISettingProvider, IDisposable
                 FontFamily = "Segoe MDL2 Assets",
                 AcceleratorKey = Key.O,
                 AcceleratorModifiers = ModifierKeys.Control,
-                Action = _ => { OpenUrl(entry.FirstUri!); return true; },
+                Action = _ => { OpenUrl(url); return true; },
             });
         }
 

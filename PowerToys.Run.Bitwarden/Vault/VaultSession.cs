@@ -24,6 +24,8 @@ internal sealed class VaultSession : IDisposable
     // outrank weak matches regardless of where they appear.
     private const int ScoreNamePrefix = 1000;
     private const int ScoreNameSubstring = 100;
+    private const int ScoreUrlPrefix = 100;
+    private const int ScoreUrlSubstring = 50;
     private const int ScoreUsernamePrefix = 50;
     private const int ScoreUsernameSubstring = 10;
 
@@ -171,15 +173,49 @@ internal sealed class VaultSession : IDisposable
 
     internal static int ScoreMatch(VaultEntry e, string q)
     {
-        var score = 0;
-        if (e.Name.StartsWith(q, StringComparison.OrdinalIgnoreCase)) score += ScoreNamePrefix;
-        else if (e.Name.Contains(q, StringComparison.OrdinalIgnoreCase)) score += ScoreNameSubstring;
+        if (string.IsNullOrEmpty(q)) return 0;
+        // Space-stripped name + query so "mybank" matches "My Bank Account" and "my bank"
+        // matches "MyBankAccount". Most item names have no spaces, so StripSpaces is a
+        // no-op for them.
+        var query = StripSpaces(q);
+        var score = TierScore(StripSpaces(e.Name), query, ScoreNamePrefix, ScoreNameSubstring);
         if (!string.IsNullOrEmpty(e.Username))
+            score += TierScore(e.Username!, query, ScoreUsernamePrefix, ScoreUsernameSubstring);
+        if (e.Uris.Count > 0)
         {
-            if (e.Username!.StartsWith(q, StringComparison.OrdinalIgnoreCase)) score += ScoreUsernamePrefix;
-            else if (e.Username.Contains(q, StringComparison.OrdinalIgnoreCase)) score += ScoreUsernameSubstring;
+            // Take the best (max) match across all the item's URLs rather than summing,
+            // so items with many URLs don't unfairly outrank single-URL items.
+            var bestUrl = 0;
+            foreach (var raw in e.Uris)
+            {
+                bestUrl = Math.Max(bestUrl,
+                    TierScore(NormalizeUrlForMatch(raw), query, ScoreUrlPrefix, ScoreUrlSubstring));
+                if (bestUrl == ScoreUrlPrefix) break; // can't beat prefix
+            }
+            score += bestUrl;
         }
         return score;
+    }
+
+    // Prefix matches beat substring matches in the same field.
+    private static int TierScore(string target, string query, int prefixScore, int substringScore)
+    {
+        if (target.StartsWith(query, StringComparison.OrdinalIgnoreCase)) return prefixScore;
+        if (target.Contains(query, StringComparison.OrdinalIgnoreCase)) return substringScore;
+        return 0;
+    }
+
+    private static string StripSpaces(string s) => s.Contains(' ') ? s.Replace(" ", string.Empty) : s;
+
+    // Strip schema and leading www. so "github" matches "https://www.github.com" cleanly
+    // and noise like "https" doesn't substring-match every URL.
+    private static string NormalizeUrlForMatch(string url)
+    {
+        var u = url;
+        if (u.StartsWith("https://", StringComparison.OrdinalIgnoreCase)) u = u[8..];
+        else if (u.StartsWith("http://", StringComparison.OrdinalIgnoreCase)) u = u[7..];
+        if (u.StartsWith("www.", StringComparison.OrdinalIgnoreCase)) u = u[4..];
+        return u;
     }
 
     // Accepts a bare host like "bitwarden.eu" or a full URL. The CLI requires a full URL
@@ -344,7 +380,12 @@ internal sealed class VaultSession : IDisposable
             var fresh = items
                 .Where(i => i.Type == 1 && i.DeletedDate is null)
                 .Select(i => new VaultEntry(
-                    i.Id, i.Name, i.Login?.Username, i.Login?.Uris?.FirstOrDefault()?.Uri))
+                    i.Id,
+                    i.Name,
+                    i.Login?.Username,
+                    i.Login?.Uris is { } uris
+                        ? uris.Where(u => !string.IsNullOrEmpty(u.Uri)).Select(u => u.Uri!).ToArray()
+                        : Array.Empty<string>()))
                 .OrderBy(e => e.Name, StringComparer.OrdinalIgnoreCase)
                 .ToList();
             _itemsCache = fresh;

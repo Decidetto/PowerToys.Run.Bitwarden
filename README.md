@@ -6,7 +6,7 @@ Type the action keyword (default: `bw`) and start typing to find your desired we
 
 ## Features
 
-- **Fast local search**: type `bw <query>` to fuzzy-match by item name or username. Results filter as you type.
+- **Fast local search**: type `bw <query>` to fuzzy-match by item name, username, or URL. Results filter as you type.
 - **Enter copies the password**, hidden the entire time, never displayed on screen.
 - **Sub-actions** on each result:
   - `Ctrl+C` — copy the item's username

@@ -1,6 +1,6 @@
 # Bitwarden plugin for PowerToys Run
 
-Search your Bitwarden vault from PowerToys Run and copy passwords to the clipboard, without ever opening the app.
+Search your Bitwarden (or compatible) vault from PowerToys Run and copy passwords to the clipboard, without ever opening the app.
 
 Type the action keyword (default: `bw`) and start typing to find your desired website/account. Pick an item to copy its password to your clipboard. Auto-clears from the clipboard after 30 seconds.
 
@@ -9,11 +9,11 @@ Type the action keyword (default: `bw`) and start typing to find your desired we
 - **Fast local search**: type `bw <query>` to fuzzy-match by item name, username, or URL. Results filter as you type.
 - **Enter copies the password**, hidden the entire time, never displayed on screen.
 - **Sub-actions** on each result:
-  - `Ctrl+C` — copy the item's username
-  - `Ctrl+O` — open the item's URL in your default browser
+  - `Ctrl+C` - copy the item's username
+  - `Ctrl+O` - open the item's URL in your default browser
 - **Commands**:
-  - `bw :sync` — manually sync with the Bitwarden server
-  - `bw :lock` — lock the vault immediately
+  - `bw :sync` - manually sync with the Bitwarden server
+  - `bw :lock` - lock the vault immediately
 - **Unlock** vault via a discreet dialog popup that obscures the characters of your master password.
 - **Auto-lock** after a configurable idle timeout (default 30 minutes; set to `0` to stay unlocked until PowerToys closes).
   - Also locks vault automatically when Windows locks the session or you disconnect from an RDP session.
@@ -65,7 +65,7 @@ The master password still controls *unlocking* the vault. You'll be prompted for
 | **Server URL** | empty | Leave empty for `bitwarden.com`. Set to your Vaultwarden / self-hosted URL otherwise. Accepts bare hosts like `bitwarden.eu`. |
 | **API client_id** | - | From web vault → Account Settings → Security → Keys. The plugin migrates this to encrypted local storage once both credential fields are present. |
 | **API client_secret** | - | The matching secret. The plugin migrates this to encrypted local storage once both credential fields are present. |
-| **Auto-lock after (minutes)** | 30 | `0` = stay unlocked until PowerToys closes. Range 0–1440. |
+| **Auto-lock after (minutes)** | 30 | `0` = stay unlocked until PowerToys closes. Range 0-1440. |
 | **Rank results by pick frequency** | on | Items you've copied more often float to the top. |
 | **Bitwarden CLI path (advanced)** | empty | Optional override. Leave empty to resolve `bw.exe` / `bw.cmd` from `PATH`. |
 
@@ -110,5 +110,5 @@ Currently supported:
 
 ## Acknowledgements
 
-- The [Bitwarden CLI](https://bitwarden.com/help/cli/) does all the heavy lifting; this plugin is a thin search-and-clipboard layer over it.
+- The [Bitwarden CLI](https://bitwarden.com/help/cli/) does all the heavy lifting. This plugin is a thin search-and-clipboard layer over it.
 - Built on the [Community.PowerToys.Run.Plugin.Dependencies](https://www.nuget.org/packages/Community.PowerToys.Run.Plugin.Dependencies) package.

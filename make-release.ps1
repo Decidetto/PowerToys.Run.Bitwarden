@@ -51,6 +51,8 @@ foreach ($platform in 'x64', 'ARM64') {
         Copy-Item $src $dst
     }
 
+    Copy-Item (Join-Path $root 'LICENSE') (Join-Path $stageDir 'LICENSE')
+
     $archLower = $platform.ToLowerInvariant()
     $zipPath = Join-Path $outputRoot "Bitwarden-v$version-$archLower.zip"
     Compress-Archive -Path $stageDir -DestinationPath $zipPath -Force

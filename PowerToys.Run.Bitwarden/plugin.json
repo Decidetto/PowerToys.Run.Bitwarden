@@ -4,7 +4,7 @@
   "IsGlobal": false,
   "Name": "Bitwarden",
   "Author": "Decidetto",
-  "Version": "0.1.0",
+  "Version": "0.1.2",
   "Language": "csharp",
   "Website": "https://bitwarden.com/",
   "ExecuteFileName": "PowerToys.Run.Bitwarden.dll",

@@ -5,7 +5,6 @@
 # Release pipeline files
 /release-staging/
 /release-output/
-make-release.ps1
 
 # Visual Studio / Rider / VS Code workspace state
 .vs/

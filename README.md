@@ -23,7 +23,8 @@ Type the action keyword (default: `bw`) and start typing to find your desired we
 ## Security
 
 - **Master password is never stored.** Entered on demand into a `PasswordBox` (no plaintext in `settings.json`, no DPAPI sidecar), used once, then zeroed.
-- **API credentials** (client ID + secret) are stored in PowerToys Run's settings. They authenticate to the server but do not decrypt anything; the vault stays locked until you enter the master password.
+- **API credentials** (client ID + secret) authenticate to the server but do not decrypt anything; the vault stays locked until you enter the master password.
+- **API credentials are migrated to encrypted local storage** after you enter both values in settings. The plugin stores them in a DPAPI-protected sidecar file for your Windows user and clears the plaintext settings fields.
 - **Copied passwords auto-clear from the clipboard after 30 seconds.**
 - **Passwords are excluded from Win+V clipboard history and cloud-clipboard sync**
 - **Vault re-locks** on Windows session lock, console disconnect, or RDP disconnect.
@@ -32,7 +33,7 @@ Type the action keyword (default: `bw`) and start typing to find your desired we
 
 - Windows 10/11
 - [PowerToys](https://github.com/microsoft/PowerToys) with PowerToys Run enabled
-- [Bitwarden CLI](https://bitwarden.com/help/cli/) (`bw.exe` on `PATH`, or set a custom path in plugin settings). Must be installed separately
+- [Bitwarden CLI](https://bitwarden.com/help/cli/) (`bw.exe` or npm's `bw.cmd` on `PATH`, or set a custom path in plugin settings). Must be installed separately
 - API credentials for your vault
 
 ## Installation
@@ -43,7 +44,7 @@ Type the action keyword (default: `bw`) and start typing to find your desired we
    %LOCALAPPDATA%\Microsoft\PowerToys\PowerToys Run\Plugins\
    ```
 3. Restart PowerToys.
-4. Open PowerToys Settings → PowerToys Run → Bitwarden, and fill in the settings below.
+4. Open PowerToys Settings → PowerToys Run → Bitwarden, and fill in the settings below. Once both API credential fields are entered, they are saved securely when settings are applied or the plugin is next queried.
 
 ## Setting up your API key
 
@@ -62,11 +63,11 @@ The master password still controls *unlocking* the vault. You'll be prompted for
 | Setting | Default | Notes |
 |---|---|---|
 | **Server URL** | empty | Leave empty for `bitwarden.com`. Set to your Vaultwarden / self-hosted URL otherwise. Accepts bare hosts like `bitwarden.eu`. |
-| **API client_id** | - | From web vault → Account Settings → Security → Keys. |
-| **API client_secret** | - | The matching secret. |
+| **API client_id** | - | From web vault → Account Settings → Security → Keys. The plugin migrates this to encrypted local storage once both credential fields are present. |
+| **API client_secret** | - | The matching secret. The plugin migrates this to encrypted local storage once both credential fields are present. |
 | **Auto-lock after (minutes)** | 30 | `0` = stay unlocked until PowerToys closes. Range 0–1440. |
 | **Rank results by pick frequency** | on | Items you've copied more often float to the top. |
-| **Bitwarden CLI path (advanced)** | empty | Optional override. Leave empty to resolve `bw.exe` from `PATH`. |
+| **Bitwarden CLI path (advanced)** | empty | Optional override. Leave empty to resolve `bw.exe` / `bw.cmd` from `PATH`. |
 
 ## Usage
 

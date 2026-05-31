@@ -12,7 +12,7 @@ internal sealed record PluginSettings(
 {
     public static readonly PluginSettings Empty = new(null, "", "", 30, null, UsageBoostEnabled: true);
 
-    public IEnumerable<PluginAdditionalOption> BuildAdditionalOptions() => new[]
+    public IEnumerable<PluginAdditionalOption> BuildAdditionalOptions(bool hasStoredCredentials = false) => new[]
     {
         new PluginAdditionalOption
         {
@@ -26,17 +26,23 @@ internal sealed record PluginSettings(
         {
             Key = nameof(ClientId),
             DisplayLabel = "API client_id",
-            DisplayDescription = "From vault.bitwarden.com → Account Settings → Security → Keys (the user.<...> value).",
+            DisplayDescription = hasStoredCredentials
+                ? "Saved securely for this Windows user. Enter a new value to replace it."
+                : "From vault.bitwarden.com → Account Settings → Security → Keys (the user.<...> value).",
             PluginOptionType = PluginAdditionalOption.AdditionalOptionType.Textbox,
             TextValue = ClientId,
+            PlaceholderText = hasStoredCredentials ? "Saved securely" : "user.<...>",
         },
         new PluginAdditionalOption
         {
             Key = nameof(ClientSecret),
             DisplayLabel = "API client_secret",
-            DisplayDescription = "The matching client_secret value.",
+            DisplayDescription = hasStoredCredentials
+                ? "Saved securely for this Windows user. Enter a new value to replace it."
+                : "The matching client_secret value.",
             PluginOptionType = PluginAdditionalOption.AdditionalOptionType.Textbox,
             TextValue = ClientSecret,
+            PlaceholderText = hasStoredCredentials ? "Saved securely" : "client secret",
         },
         new PluginAdditionalOption
         {
@@ -63,7 +69,7 @@ internal sealed record PluginSettings(
         {
             Key = nameof(BwExePathOverride),
             DisplayLabel = "Bitwarden CLI path (advanced)",
-            DisplayDescription = "Optional override. Leave empty to resolve 'bw' / 'bw.exe' from PATH.",
+            DisplayDescription = "Optional override. Leave empty to resolve 'bw.exe' / 'bw.cmd' from PATH.",
             PluginOptionType = PluginAdditionalOption.AdditionalOptionType.Textbox,
             TextValue = BwExePathOverride ?? string.Empty,
         },

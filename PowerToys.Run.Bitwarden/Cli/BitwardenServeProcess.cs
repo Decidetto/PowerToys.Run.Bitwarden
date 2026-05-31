@@ -29,26 +29,33 @@ internal sealed class BitwardenServeProcess : IDisposable
     {
         Port = PickFreeLoopbackPort();
 
-        var psi = new ProcessStartInfo
-        {
-            FileName = _exePath,
-            UseShellExecute = false,
-            CreateNoWindow = true,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-        };
-        psi.ArgumentList.Add("serve");
-        psi.ArgumentList.Add("--hostname");
-        psi.ArgumentList.Add(LoopbackHost);
-        psi.ArgumentList.Add("--port");
-        psi.ArgumentList.Add(Port.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        var psi = BitwardenProcess.CreateStartInfo(_exePath,
+        [
+            "serve",
+            "--hostname",
+            LoopbackHost,
+            "--port",
+            Port.ToString(System.Globalization.CultureInfo.InvariantCulture),
+        ]);
 
         _job = new ChildProcessJob();
         _proc = new Process { StartInfo = psi };
+        _proc.OutputDataReceived += (_, e) =>
+        {
+            if (!string.IsNullOrEmpty(e.Data))
+                Log.Debug($"bw serve stdout: {e.Data}", typeof(BitwardenServeProcess));
+        };
+        _proc.ErrorDataReceived += (_, e) =>
+        {
+            if (!string.IsNullOrEmpty(e.Data))
+                Log.Warn($"bw serve stderr: {e.Data}", typeof(BitwardenServeProcess));
+        };
         _proc.Start();
+        _proc.BeginOutputReadLine();
+        _proc.BeginErrorReadLine();
         _job.AssignProcess(_proc);
 
-        Log.Debug($"bw serve PID={_proc.Id} listening on {LoopbackHost}:{Port}", typeof(BitwardenServeProcess));
+        Log.Debug($"bw serve PID={_proc.Id} command={BitwardenProcess.Describe(psi)} listening on {LoopbackHost}:{Port}", typeof(BitwardenServeProcess));
     }
 
     private static int PickFreeLoopbackPort()

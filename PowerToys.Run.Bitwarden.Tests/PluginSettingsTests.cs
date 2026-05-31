@@ -70,6 +70,19 @@ public class PluginSettingsTests
     }
 
     [Fact]
+    public void BuildAdditionalOptions_WithStoredCredentials_ShowsSecurePlaceholders()
+    {
+        var options = PluginSettings.Empty.BuildAdditionalOptions(hasStoredCredentials: true).ToArray();
+        var clientId = options.Single(o => o.Key == "ClientId");
+        var clientSecret = options.Single(o => o.Key == "ClientSecret");
+
+        Assert.Equal("Saved securely", clientId.PlaceholderText);
+        Assert.Equal("Saved securely", clientSecret.PlaceholderText);
+        Assert.Contains("Saved securely", clientId.DisplayDescription);
+        Assert.Contains("Saved securely", clientSecret.DisplayDescription);
+    }
+
+    [Fact]
     public void From_EmptyStringServerUrl_ParsesAsNull()
     {
         var options = new[]

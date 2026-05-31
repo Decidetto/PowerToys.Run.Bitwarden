@@ -10,37 +10,64 @@ internal sealed class BitwardenCli
     // Env var names the bw CLI itself recognises
     private const string ClientIdEnvVar = "BW_CLIENTID";
     private const string ClientSecretEnvVar = "BW_CLIENTSECRET";
+    private static readonly TimeSpan CommandTimeout = TimeSpan.FromSeconds(15);
 
     public string ExePath { get; }
 
     public BitwardenCli(string? overridePath)
     {
-        if (!string.IsNullOrWhiteSpace(overridePath) && File.Exists(overridePath))
+        var normalizedOverride = NormalizeOverridePath(overridePath);
+        if (normalizedOverride is not null)
         {
-            ExePath = overridePath!;
+            ExePath = normalizedOverride;
         }
         else
         {
-            ExePath = ResolveFromPath() ?? "bw";
+            ExePath = ResolveFromPath(Environment.GetEnvironmentVariable("PATH") ?? string.Empty) ?? "bw";
         }
     }
 
-    private static string? ResolveFromPath()
+    internal static string? ResolveFromPath(string path)
     {
-        var path = Environment.GetEnvironmentVariable("PATH") ?? string.Empty;
         foreach (var dir in path.Split(Path.PathSeparator))
         {
-            foreach (var name in new[] { "bw.exe", "bw" })
+            foreach (var name in new[] { "bw.exe", "bw.cmd", "bw.bat", "bw" })
             {
                 try
                 {
-                    var candidate = Path.Combine(dir.Trim(), name);
+                    var candidate = Path.Combine(dir.Trim().Trim('"'), name);
                     if (File.Exists(candidate)) return candidate;
                 }
                 catch { /* skip malformed PATH entries */ }
             }
         }
         return null;
+    }
+
+    private static string? NormalizeOverridePath(string? overridePath)
+    {
+        if (string.IsNullOrWhiteSpace(overridePath)) return null;
+
+        var path = overridePath.Trim().Trim('"');
+        var ext = Path.GetExtension(path);
+        if (ext.Length == 0)
+        {
+            foreach (var shimExt in new[] { ".exe", ".cmd", ".bat" })
+            {
+                var shim = path + shimExt;
+                if (File.Exists(shim)) return shim;
+            }
+        }
+        if (!File.Exists(path)) return null;
+
+        if (ext.Length == 0) return path;
+        if (ext.Equals(".ps1", StringComparison.OrdinalIgnoreCase))
+        {
+            var cmdShim = Path.ChangeExtension(path, ".cmd");
+            if (File.Exists(cmdShim)) return cmdShim;
+        }
+
+        return path;
     }
 
     public bool IsAvailable() => File.Exists(ExePath);
@@ -83,15 +110,7 @@ internal sealed class BitwardenCli
         IDictionary<string, string>? env,
         CancellationToken ct)
     {
-        var psi = new ProcessStartInfo
-        {
-            FileName = ExePath,
-            UseShellExecute = false,
-            CreateNoWindow = true,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-        };
-        foreach (var a in args) psi.ArgumentList.Add(a);
+        var psi = BitwardenProcess.CreateStartInfo(ExePath, args);
         if (env != null)
         {
             foreach (var kv in env)
@@ -100,9 +119,31 @@ internal sealed class BitwardenCli
 
         using var proc = new Process { StartInfo = psi };
         proc.Start();
-        var stdoutTask = proc.StandardOutput.ReadToEndAsync(ct);
-        var stderrTask = proc.StandardError.ReadToEndAsync(ct);
-        await proc.WaitForExitAsync(ct);
+        using var timeoutCts = new CancellationTokenSource(CommandTimeout);
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(ct, timeoutCts.Token);
+
+        var stdoutTask = proc.StandardOutput.ReadToEndAsync();
+        var stderrTask = proc.StandardError.ReadToEndAsync();
+        try
+        {
+            await proc.WaitForExitAsync(linkedCts.Token);
+        }
+        catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested && !ct.IsCancellationRequested)
+        {
+            try { proc.Kill(entireProcessTree: true); }
+            catch { /* process may have exited after timeout fired */ }
+            try { await proc.WaitForExitAsync(CancellationToken.None); }
+            catch { /* best-effort cleanup */ }
+            Log.Warn($"bw command timed out after {CommandTimeout.TotalSeconds:F0}s: {BitwardenProcess.Describe(psi)}", typeof(BitwardenCli));
+            return (-1, string.Empty, "Timed out waiting for bw command to exit.");
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            try { proc.Kill(entireProcessTree: true); }
+            catch { /* process may have exited after cancellation fired */ }
+            throw;
+        }
+
         return (proc.ExitCode, await stdoutTask, await stderrTask);
     }
 }

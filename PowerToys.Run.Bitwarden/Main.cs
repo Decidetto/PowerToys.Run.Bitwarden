@@ -1,9 +1,11 @@
 using ManagedCommon;
 using Microsoft.PowerToys.Settings.UI.Library;
+using PowerToys.Run.Bitwarden.Settings;
 using PowerToys.Run.Bitwarden.Security;
 using PowerToys.Run.Bitwarden.Vault;
 using System.Diagnostics;
 using System.IO;
+using System.Text.Json.Nodes;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
@@ -29,6 +31,8 @@ public sealed class Main : IPlugin, IContextMenu, ISettingProvider, IDisposable
 
     private PluginSettings _settings = PluginSettings.Empty;
     private VaultSession? _session;
+    private ApiCredentialStore? _credentialStore;
+    private int _credentialMigrationReconfigurePending;
     private bool _hasBeenReady;
     private bool _hasFinishedInitialBoot;
     // Captured when the user invokes the Unlock prompt so we can put it right back into
@@ -38,7 +42,7 @@ public sealed class Main : IPlugin, IContextMenu, ISettingProvider, IDisposable
     // dialogs; the second ShowDialog throws InvalidOperationException.
     private volatile bool _unlockDialogOpen;
 
-    public IEnumerable<PluginAdditionalOption> AdditionalOptions => _settings.BuildAdditionalOptions();
+    public IEnumerable<PluginAdditionalOption> AdditionalOptions => _settings.BuildAdditionalOptions(HasStoredApiCredentials());
 
     public void Init(PluginInitContext context)
     {
@@ -46,13 +50,11 @@ public sealed class Main : IPlugin, IContextMenu, ISettingProvider, IDisposable
         _context.API.ThemeChanged += OnThemeChanged;
         UpdateIcons();
 
-        var dataDir = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "Microsoft", "PowerToys", "PowerToys Run", "Settings", "Plugins",
-            typeof(Main).Assembly.GetName().Name ?? "PowerToys.Run.Bitwarden");
+        var dataDir = GetPluginDataDirectory();
         Directory.CreateDirectory(dataDir);
 
-        _session = new VaultSession(dataDir);
+        _credentialStore = new ApiCredentialStore(dataDir);
+        _session = new VaultSession(dataDir, _credentialStore);
         _session.StateChanged += OnSessionStateChanged;
 
         // Init runs off PT's UI thread so a slow CLI doesn't stall PT Run startup.
@@ -67,6 +69,8 @@ public sealed class Main : IPlugin, IContextMenu, ISettingProvider, IDisposable
     public List<Result> Query(Query query)
     {
         if (_session is null) return [];
+        if (_session.State == VaultState.LoggedOut)
+            TryMigrateApiCredentialsFromPowerToysSettings();
         var icon = CurrentIcon;
         // PT rewrites the input box on result navigation to "<ActionKeyword> <QueryTextDisplay>".
         // Setting every result's QueryTextDisplay to the current search portion makes that
@@ -113,8 +117,9 @@ public sealed class Main : IPlugin, IContextMenu, ISettingProvider, IDisposable
             case VaultState.LoggedOut:
                 return [ new Result
                 {
-                    Title = "Bitwarden - not configured",
-                    SubTitle = "Open PowerToys Settings → PowerToys Run → Bitwarden and fill in your API client ID and secret.",
+                    Title = "Bitwarden - not signed in",
+                    SubTitle = _session.LastError
+                        ?? "Open PowerToys Settings → PowerToys Run → Bitwarden and fill in your API client ID and secret.",
                     IcoPath = icon,
                     QueryTextDisplay = searchText,
                 } ];
@@ -338,12 +343,14 @@ public sealed class Main : IPlugin, IContextMenu, ISettingProvider, IDisposable
     public void UpdateSettings(PowerLauncherPluginSettings settings)
     {
         var incoming = PluginSettings.From(settings.AdditionalOptions);
+        var migratedCredentials = false;
+        incoming = MigrateApiCredentialsFromSettings(incoming, out migratedCredentials);
         var diff = PluginSettings.Diff(_settings, incoming);
         _settings = incoming;
 
         if (_session is null) return;
 
-        if (diff.AuthChanged)
+        if (diff.AuthChanged || migratedCredentials)
         {
             // Reconfigure rebuilds the session and picks up all non-auth setting values
             // along the way, so the per-setting Apply* calls below would be redundant.
@@ -465,6 +472,106 @@ public sealed class Main : IPlugin, IContextMenu, ISettingProvider, IDisposable
     // PT calls this on certain settings interactions. Returning an empty UserControl
     // tells PT to fall back to rendering AdditionalOptions, which is what we want.
     public Control CreateSettingPanel() => new UserControl();
+
+    private PluginSettings MigrateApiCredentialsFromSettings(PluginSettings incoming, out bool migrated)
+    {
+        migrated = false;
+        if (string.IsNullOrWhiteSpace(incoming.ClientId) && string.IsNullOrWhiteSpace(incoming.ClientSecret))
+            return incoming;
+
+        if (string.IsNullOrWhiteSpace(incoming.ClientId) || string.IsNullOrWhiteSpace(incoming.ClientSecret))
+            return incoming;
+
+        if (_credentialStore?.Save(new ApiCredentials(incoming.ClientId, incoming.ClientSecret)) == true)
+        {
+            migrated = true;
+            PowerToysRunSettingsCleaner.ClearPlaintextApiCredentials();
+            return incoming with { ClientId = string.Empty, ClientSecret = string.Empty };
+        }
+
+        return incoming;
+    }
+
+    private void TryMigrateApiCredentialsFromPowerToysSettings()
+    {
+        if (_credentialStore is null) return;
+        if (Interlocked.CompareExchange(ref _credentialMigrationReconfigurePending, 1, 0) != 0) return;
+
+        var shouldReconfigure = false;
+        try
+        {
+            var credentials = TryReadPlaintextApiCredentialsFromPowerToysSettings();
+            if (credentials is null) return;
+            if (!_credentialStore.Save(credentials)) return;
+            shouldReconfigure = true;
+        }
+        finally
+        {
+            if (!shouldReconfigure) Volatile.Write(ref _credentialMigrationReconfigurePending, 0);
+        }
+
+        PowerToysRunSettingsCleaner.ClearPlaintextApiCredentials();
+        _settings = _settings with { ClientId = string.Empty, ClientSecret = string.Empty };
+
+        var session = _session;
+        if (session is null)
+        {
+            Volatile.Write(ref _credentialMigrationReconfigurePending, 0);
+            return;
+        }
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await session.ReconfigureAsync(_settings, CancellationToken.None);
+                ForceRefreshAfterExplicitAction();
+            }
+            catch (Exception ex) { Log.Exception("Credential migration reconfigure failed", ex, typeof(Main)); }
+            finally { Volatile.Write(ref _credentialMigrationReconfigurePending, 0); }
+        });
+    }
+
+    private static ApiCredentials? TryReadPlaintextApiCredentialsFromPowerToysSettings()
+    {
+        try
+        {
+            var path = PowerToysRunSettingsCleaner.GetPowerToysRunSettingsPath();
+            if (!File.Exists(path)) return null;
+            var root = JsonNode.Parse(File.ReadAllText(path)) as JsonObject;
+            var options = PowerToysRunSettingsCleaner.FindPluginAdditionalOptions(root, PluginID);
+            if (options is null) return null;
+
+            string? clientId = null;
+            string? clientSecret = null;
+            foreach (var option in options.OfType<JsonObject>())
+            {
+                var key = option["Key"]?.GetValue<string>();
+                if (key == nameof(PluginSettings.ClientId))
+                    clientId = option["TextValue"]?.GetValue<string>();
+                else if (key == nameof(PluginSettings.ClientSecret))
+                    clientSecret = option["TextValue"]?.GetValue<string>();
+            }
+
+            var credentials = new ApiCredentials(clientId ?? string.Empty, clientSecret ?? string.Empty);
+            return credentials.IsComplete ? credentials : null;
+        }
+        catch (Exception ex)
+        {
+            Log.Exception("TryReadPlaintextApiCredentialsFromPowerToysSettings failed", ex, typeof(Main));
+            return null;
+        }
+    }
+
+    private bool HasStoredApiCredentials()
+    {
+        if (_credentialStore?.Exists == true) return true;
+        return File.Exists(Path.Combine(GetPluginDataDirectory(), "api-credentials.json"));
+    }
+
+    private static string GetPluginDataDirectory() => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "Microsoft", "PowerToys", "PowerToys Run", "Settings", "Plugins",
+        typeof(Main).Assembly.GetName().Name ?? "PowerToys.Run.Bitwarden");
 
     private string CurrentIcon =>
         _context?.API?.GetCurrentTheme() is Theme.Light or Theme.HighContrastWhite

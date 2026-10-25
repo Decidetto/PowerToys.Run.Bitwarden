@@ -33,6 +33,7 @@ internal sealed class VaultSession : IDisposable
     private readonly SemaphoreSlim _gate = new(1, 1);
     private readonly UsageStats _usage;
     private readonly ApiCredentialStore? _credentialStore;
+    private readonly string _cliDataDirectory;
 
     private BitwardenServeProcess? _serve;
     private BitwardenClient? _client;
@@ -40,10 +41,6 @@ internal sealed class VaultSession : IDisposable
     private System.Threading.Timer? _autoLockTimer;
     private System.Threading.Timer? _syncTimer;
     private int _syncTimerRunning;
-    // Holds an in-flight pre-unlock sync kicked off when the user clicked Unlock. The
-    // unlock path awaits this before refreshing the cache, so the user sees fresh data
-    // when the vault opens.
-    private Task? _pendingSync;
     private DateTime _lastActivityUtc = DateTime.UtcNow;
     private volatile VaultState _state = VaultState.Uninitialized;
     // Reference swap is atomic on the CLR. Readers always see a fully populated list.
@@ -59,6 +56,7 @@ internal sealed class VaultSession : IDisposable
     {
         _usage = new UsageStats(Path.Combine(dataDir, "usage.json"));
         _credentialStore = credentialStore;
+        _cliDataDirectory = Path.Combine(Path.GetFullPath(dataDir), "cli");
         SystemEvents.SessionSwitch += OnWindowsSessionSwitch;
         _sessionSwitchSubscribed = true;
     }
@@ -70,11 +68,11 @@ internal sealed class VaultSession : IDisposable
         try
         {
             _settings = settings;
+            DisposeRuntime();
             Transition(VaultState.Initializing, changedStates);
             await BuildSessionAsync(ct, changedStates);
         }
-        finally { _gate.Release(); }
-        NotifyStateChanged(changedStates);
+        finally { _gate.Release(); NotifyStateChanged(changedStates); }
     }
 
     // Auth-affecting changes (server URL, client_id, client_secret, bw path).
@@ -89,8 +87,7 @@ internal sealed class VaultSession : IDisposable
             Transition(VaultState.Initializing, changedStates);
             await BuildSessionAsync(ct, changedStates);
         }
-        finally { _gate.Release(); }
-        NotifyStateChanged(changedStates);
+        finally { _gate.Release(); NotifyStateChanged(changedStates); }
     }
 
     // Lock-policy-only update. No need to log out or restart bw serve.
@@ -109,42 +106,70 @@ internal sealed class VaultSession : IDisposable
         _settings = _settings with { UsageBoostEnabled = enabled };
     }
 
-    public async Task<bool> UnlockWithPasswordAsync(SecureString password, CancellationToken ct)
+    public async Task<UnlockResult> UnlockWithPasswordAsync(SecureString password, CancellationToken ct)
     {
-        if (password is null || password.Length == 0) return false;
         var changedStates = new List<VaultState>();
         await _gate.WaitAsync(ct);
         try
         {
-            // bw serve is pre-warmed at Init, so we always have a running daemon to talk to.
-            if (_client is null)
-            {
-                LastError = "bw serve is not running. Try toggling a setting to reconfigure.";
-                return false;
-            }
-            var client = _client;
-
             LastError = null;
-            var ok = await client.UnlockAsync(password, ct);
-            if (!ok) { LastError = "Wrong master password."; return false; }
+            if (password is null || password.Length == 0)
+                return UnlockFailed("Enter your master password.");
+            if (_client is null)
+                return UnlockFailed("The local CLI is not running. Reapply the plugin settings or restart PowerToys.");
 
-            // Wait for any running pre-unlock background sync to finish before refreshing.
-            var pending = _pendingSync;
-            _pendingSync = null;
-            if (pending is not null) await pending;
-
-            if (!await RefreshCacheAsync(client, ct))
+            var client = _client;
+            try
             {
-                LastError = "Vault unlocked but failed to load items. See PowerToys Run logs.";
-                // Re-lock to keep our state and bw serve's state coherent.
-                try { await client.LockAsync(ct); }
-                catch (Exception ex) { Log.Exception("Re-lock after refresh failure failed", ex, typeof(VaultSession)); }
-                return false;
+                await client.UnlockAsync(password, ct);
+                // Sync and unlock must not race: sync can change the CLI's account/key
+                // state. Keep the entire unlock/sync/cache transaction under _gate.
+                await client.SyncAsync(ct);
+                if (!await RefreshCacheAsync(client, ct))
+                    throw new BitwardenException(LastError ?? "Vault unlocked but failed to load items.");
+                Transition(VaultState.Ready, changedStates);
+                return UnlockResult.Unlocked;
             }
-            Transition(VaultState.Ready, changedStates);
-            return true;
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                await RelockAfterUnlockFailureAsync(client, changedStates);
+                throw;
+            }
+            catch (Exception ex)
+            {
+                var error = ex is BitwardenException
+                    ? ex.Message
+                    : "Unlock failed because of an unexpected plugin error. Restart PowerToys.";
+                // A timeout or a later sync/cache failure can happen after the CLI has
+                // already unlocked. Do not leave that daemon unlocked after UI failure.
+                await RelockAfterUnlockFailureAsync(client, changedStates);
+                return UnlockFailed(error);
+            }
         }
         finally { _gate.Release(); NotifyStateChanged(changedStates); }
+    }
+
+    private UnlockResult UnlockFailed(string error)
+    {
+        LastError = error;
+        return UnlockResult.Failed(error);
+    }
+
+    private async Task RelockAfterUnlockFailureAsync(BitwardenClient client, List<VaultState> changedStates)
+    {
+        _itemsCache = null;
+        try
+        {
+            await client.LockAsync(CancellationToken.None);
+            Transition(VaultState.Locked, changedStates);
+        }
+        catch
+        {
+            // If re-locking cannot be confirmed, terminating our daemon is the safe
+            // fallback. Never expose the underlying exception or response body.
+            DisposeRuntime();
+            Transition(VaultState.Failed, changedStates);
+        }
     }
 
     public IReadOnlyList<VaultEntry> Search(string query)
@@ -230,8 +255,9 @@ internal sealed class VaultSession : IDisposable
 
     // Accepts a bare host like "bitwarden.eu" or a full URL. The CLI requires a full URL
     // (and the well-known "bitwarden.eu" / "bitwarden.com" forms point at vault.<host>).
-    internal static string NormalizeServerUrl(string input)
+    internal static string NormalizeServerUrl(string? input)
     {
+        if (string.IsNullOrWhiteSpace(input)) return "https://vault.bitwarden.com";
         var s = input.Trim().TrimEnd('/');
         if (s.StartsWith("http://", StringComparison.OrdinalIgnoreCase) ||
             s.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
@@ -240,22 +266,6 @@ internal sealed class VaultSession : IDisposable
             s.Equals("bitwarden.com", StringComparison.OrdinalIgnoreCase))
             return "https://vault." + s;
         return "https://" + s;
-    }
-
-    // Fire-and-forget sync, kicked off when the user opens the Unlock dialog.
-    // UnlockWithPasswordAsync awaits this before reading the cache.
-    public void StartBackgroundSync()
-    {
-        var client = _client;
-        if (client is null) return;
-        var existing = _pendingSync;
-        if (existing is not null && !existing.IsCompleted) return;
-
-        _pendingSync = Task.Run(async () =>
-        {
-            try { await client.SyncAsync(CancellationToken.None); }
-            catch (Exception ex) { Log.Exception("Pre-unlock background sync failed", ex, typeof(VaultSession)); }
-        });
     }
 
     // User-triggered "force sync". Takes the gate so we can't race a reconfigure or unlock.
@@ -267,9 +277,14 @@ internal sealed class VaultSession : IDisposable
         {
             if (_state != VaultState.Ready || _client is null) return false;
             var client = _client;
-            var ok = await client.SyncAsync(ct);
-            if (ok) ok = await RefreshCacheAsync(client, ct);
-            return ok;
+            LastError = null;
+            await client.SyncAsync(ct);
+            return await RefreshCacheAsync(client, ct);
+        }
+        catch (BitwardenException ex)
+        {
+            LastError = ex.Message;
+            return false;
         }
         finally { _gate.Release(); }
     }
@@ -312,7 +327,7 @@ internal sealed class VaultSession : IDisposable
         try
         {
             LastError = null;
-            var cli = new BitwardenCli(_settings.BwExePathOverride);
+            var cli = new BitwardenCli(_settings.BwExePathOverride, _cliDataDirectory);
             if (!cli.IsAvailable())
             {
                 LastError = "Bitwarden CLI ('bw') not found on PATH.";
@@ -320,31 +335,17 @@ internal sealed class VaultSession : IDisposable
                 return;
             }
 
-            if (!string.IsNullOrWhiteSpace(_settings.ServerUrl))
-                await cli.ConfigServerAsync(NormalizeServerUrl(_settings.ServerUrl!), ct);
-
-            var status = await cli.StatusAsync(ct);
-            if (status == BwStatus.Unauthenticated)
+            var credentials = GetEffectiveCredentials();
+            if (credentials is null || !credentials.IsComplete)
             {
-                var credentials = GetEffectiveCredentials();
-                if (credentials is null)
-                {
-                    LastError = "API client_id and client_secret are required.";
-                    Transition(VaultState.LoggedOut, changedStates);
-                    return;
-                }
-                var ok = await cli.LoginApiKeyAsync(credentials.ClientId, credentials.ClientSecret, ct);
-                if (!ok)
-                {
-                    LastError = "Login failed - verify your API credentials.";
-                    Transition(VaultState.LoggedOut, changedStates);
-                    return;
-                }
+                LastError = "API client_id and client_secret are required in the plugin settings.";
+                Transition(VaultState.LoggedOut, changedStates);
+                return;
             }
+            await cli.AuthenticateAsync(NormalizeServerUrl(_settings.ServerUrl), credentials, ct);
 
-            // Pre-warm bw serve so the user-triggered unlock is just one HTTP round-trip
-            // instead of waiting for two Node-based subprocesses to cold-start.
-            _serve = new BitwardenServeProcess(cli.ExePath);
+            // Pre-warm the daemon; unlocking then uses the existing local HTTP client.
+            _serve = new BitwardenServeProcess(cli.ExePath, cli.DataDirectory);
             _serve.Start();
             _client = new BitwardenClient(_serve.BaseUri);
             if (!await WaitForServeReadyAsync(ct))
@@ -357,22 +358,31 @@ internal sealed class VaultSession : IDisposable
 
             Transition(VaultState.Locked, changedStates);
         }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            DisposeRuntime();
+            LastError = "Bitwarden initialization was cancelled.";
+            Transition(VaultState.Failed, changedStates);
+            throw;
+        }
         catch (Exception ex)
         {
             DisposeRuntime();
-            // Avoid surfacing raw exception text through the Failed-state SubTitle.
-            // The full exception goes to the log.
-            LastError = "Failed to initialize bw serve. See PowerToys Run logs.";
-            Log.Exception("BuildSessionAsync failed", ex, typeof(VaultSession));
+            LastError = ex is BitwardenException
+                ? ex.Message
+                : "Failed to initialize the plugin's Bitwarden CLI. Check its configured path and restart PowerToys.";
+            Log.Warn(LastError, typeof(VaultSession));
             Transition(VaultState.Failed, changedStates);
         }
     }
 
     private ApiCredentials? GetEffectiveCredentials()
     {
-        if (!string.IsNullOrWhiteSpace(_settings.ClientId) && !string.IsNullOrWhiteSpace(_settings.ClientSecret))
+        if (!string.IsNullOrWhiteSpace(_settings.ClientId) || !string.IsNullOrWhiteSpace(_settings.ClientSecret))
             return new ApiCredentials(_settings.ClientId, _settings.ClientSecret);
 
+        // Both blank means the settings UI has migrated the pair to DPAPI storage.
+        // A partially entered replacement must never silently reuse the old pair.
         return _credentialStore?.Load();
     }
 
@@ -384,7 +394,10 @@ internal sealed class VaultSession : IDisposable
         var deadline = DateTime.UtcNow + ServeReadyDeadline;
         while (DateTime.UtcNow < deadline)
         {
-            if (await _client.GetStatusAsync(ct) != BwStatus.Unreachable) return true;
+            var status = await _client.GetStatusAsync(ct);
+            if (status == BwStatus.Locked) return true;
+            if (status != BwStatus.Unreachable)
+                throw new BitwardenException("The local CLI did not start with the plugin's locked login. Reapply the plugin settings.");
             await Task.Delay(delay, ct);
             if (delay < ServeReadyMaxPoll)
                 delay = TimeSpan.FromMilliseconds(
@@ -421,7 +434,9 @@ internal sealed class VaultSession : IDisposable
         }
         catch (Exception ex)
         {
-            Log.Exception("RefreshCacheAsync failed", ex, typeof(VaultSession));
+            if (ex is OperationCanceledException && ct.IsCancellationRequested) throw;
+            LastError = ex is BitwardenException ? ex.Message : "Load vault items failed: unexpected plugin error.";
+            Log.Warn(LastError, typeof(VaultSession));
             return false;
         }
     }
@@ -432,11 +447,15 @@ internal sealed class VaultSession : IDisposable
         _syncTimer = new System.Threading.Timer(async _ =>
         {
             if (Interlocked.Exchange(ref _syncTimerRunning, 1) == 1) return;
+            var acquired = false;
             try
             {
+                acquired = await _gate.WaitAsync(0);
+                if (!acquired) return;
                 var client = _client;
                 if (_state != VaultState.Ready || client is null) return;
-                if (await client.SyncAsync(CancellationToken.None) && _state == VaultState.Ready && ReferenceEquals(client, _client))
+                await client.SyncAsync(CancellationToken.None);
+                if (_state == VaultState.Ready && ReferenceEquals(client, _client))
                 {
                     await RefreshCacheAsync(
                         client,
@@ -445,7 +464,11 @@ internal sealed class VaultSession : IDisposable
                 }
             }
             catch (Exception ex) { Log.Exception("Periodic sync failed", ex, typeof(VaultSession)); }
-            finally { Interlocked.Exchange(ref _syncTimerRunning, 0); }
+            finally
+            {
+                if (acquired) _gate.Release();
+                Interlocked.Exchange(ref _syncTimerRunning, 0);
+            }
         }, null, SyncPeriod, SyncPeriod);
     }
 
@@ -575,9 +598,6 @@ internal sealed class VaultSession : IDisposable
     {
         StopAutoLockTimer();
         StopSyncTimer();
-        // Don't await the pending sync it's fire-and-forget; if it's still running it'll
-        // throw against the disposed _client below and be swallowed by its own try/catch.
-        _pendingSync = null;
         _client?.Dispose(); _client = null;
         _serve?.Dispose(); _serve = null;
         _itemsCache = null;
@@ -592,6 +612,7 @@ internal sealed class VaultSession : IDisposable
         }
         DisposeRuntime();
         _usage.Dispose();
-        _gate.Dispose();
+        // In-flight async operations still release the gate in their finally blocks.
+        // No WaitHandle is allocated; let GC reclaim the semaphore after they finish.
     }
 }

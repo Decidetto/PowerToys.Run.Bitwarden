@@ -5,7 +5,7 @@ namespace PowerToys.Run.Bitwarden.Cli;
 
 internal static class BitwardenProcess
 {
-    public static ProcessStartInfo CreateStartInfo(string exePath, IEnumerable<string> args)
+    public static ProcessStartInfo CreateStartInfo(string exePath, IEnumerable<string> args, string dataDirectory)
     {
         var psi = new ProcessStartInfo
         {
@@ -14,6 +14,8 @@ internal static class BitwardenProcess
             RedirectStandardOutput = true,
             RedirectStandardError = true,
         };
+
+        ConfigureEnvironment(psi, dataDirectory);
 
         if (IsCommandShim(exePath))
         {
@@ -30,6 +32,17 @@ internal static class BitwardenProcess
         }
 
         return psi;
+    }
+
+    internal static void ConfigureEnvironment(ProcessStartInfo psi, string dataDirectory)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(dataDirectory);
+        // A parent shell's session, credentials, or CLI flags must never choose the
+        // plugin's account. This applies equally to short commands and bw serve.
+        foreach (var key in psi.Environment.Keys.Where(k => k.StartsWith("BW_", StringComparison.OrdinalIgnoreCase)).ToArray())
+            psi.Environment.Remove(key);
+        psi.Environment["BITWARDENCLI_APPDATA_DIR"] = Path.GetFullPath(dataDirectory);
+        psi.Environment["BW_NOINTERACTION"] = "true";
     }
 
     public static string Describe(ProcessStartInfo psi)

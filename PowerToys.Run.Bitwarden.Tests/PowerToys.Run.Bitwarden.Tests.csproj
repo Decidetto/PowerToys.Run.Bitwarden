@@ -12,6 +12,9 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- PowerToys supplies NLog at runtime; session tests run outside that host. -->
+    <PackageReference Include="NLog" Version="5.4.0" />
+    <PackageReference Include="System.IO.Abstractions" Version="22.0.13" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.10.0" />
     <PackageReference Include="xunit" Version="2.9.0" />
     <PackageReference Include="xunit.runner.visualstudio" Version="2.8.0" />

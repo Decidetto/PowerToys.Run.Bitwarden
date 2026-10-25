@@ -39,7 +39,7 @@ public class BitwardenCliTests : IDisposable
         var extensionless = Touch("bw");
         var cmd = Touch("bw.cmd");
 
-        var cli = new BitwardenCli(extensionless);
+        var cli = new BitwardenCli(extensionless, _tempDir);
 
         Assert.Equal(cmd, cli.ExePath);
     }
@@ -47,7 +47,7 @@ public class BitwardenCliTests : IDisposable
     [Fact]
     public void CreateStartInfo_WrapsCommandShimInCmdExe()
     {
-        var psi = BitwardenProcess.CreateStartInfo(@"C:\Users\Test User\AppData\Roaming\npm\bw.cmd", ["serve", "--port", "8080"]);
+        var psi = BitwardenProcess.CreateStartInfo(@"C:\Users\Test User\AppData\Roaming\npm\bw.cmd", ["serve", "--port", "8080"], _tempDir);
 
         Assert.EndsWith("cmd.exe", psi.FileName, StringComparison.OrdinalIgnoreCase);
         Assert.Empty(psi.ArgumentList);
@@ -65,7 +65,7 @@ public class BitwardenCliTests : IDisposable
             echo %~1^|%~2^|%~3
             """);
 
-        var psi = BitwardenProcess.CreateStartInfo(shim, ["serve", "--port", "8080"]);
+        var psi = BitwardenProcess.CreateStartInfo(shim, ["serve", "--port", "8080"], _tempDir);
         using var proc = new Process { StartInfo = psi };
 
         proc.Start();

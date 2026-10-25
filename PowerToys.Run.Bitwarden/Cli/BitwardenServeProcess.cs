@@ -11,6 +11,7 @@ internal sealed class BitwardenServeProcess : IDisposable
     private const string LoopbackHost = "127.0.0.1";
 
     private readonly string _exePath;
+    private readonly string _dataDirectory;
     private Process? _proc;
     private ChildProcessJob? _job;
 
@@ -20,9 +21,10 @@ internal sealed class BitwardenServeProcess : IDisposable
     // bw serve starts in whatever auth state the CLI's data.json reflects (typically
     // "locked" after `bw login`). Callers then POST /unlock to move it to unlocked,
     // avoiding a separate `bw unlock` subprocess.
-    public BitwardenServeProcess(string exePath)
+    public BitwardenServeProcess(string exePath, string dataDirectory)
     {
         _exePath = exePath;
+        _dataDirectory = dataDirectory;
     }
 
     public void Start()
@@ -36,20 +38,14 @@ internal sealed class BitwardenServeProcess : IDisposable
             LoopbackHost,
             "--port",
             Port.ToString(System.Globalization.CultureInfo.InvariantCulture),
-        ]);
+        ], _dataDirectory);
 
         _job = new ChildProcessJob();
         _proc = new Process { StartInfo = psi };
-        _proc.OutputDataReceived += (_, e) =>
-        {
-            if (!string.IsNullOrEmpty(e.Data))
-                Log.Debug($"bw serve stdout: {e.Data}", typeof(BitwardenServeProcess));
-        };
-        _proc.ErrorDataReceived += (_, e) =>
-        {
-            if (!string.IsNullOrEmpty(e.Data))
-                Log.Warn($"bw serve stderr: {e.Data}", typeof(BitwardenServeProcess));
-        };
+        // Drain output without persisting it. Upstream diagnostics can include
+        // credentials or decrypted data; request failures are surfaced by the client.
+        _proc.OutputDataReceived += (_, _) => { };
+        _proc.ErrorDataReceived += (_, _) => { };
         _proc.Start();
         _proc.BeginOutputReadLine();
         _proc.BeginErrorReadLine();

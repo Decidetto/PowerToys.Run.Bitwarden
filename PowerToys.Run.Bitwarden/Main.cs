@@ -240,12 +240,13 @@ public sealed class Main : IPlugin, IContextMenu, ISettingProvider, IDisposable
 
     private void TriggerSync()
     {
-        if (_session is null) return;
+        var session = _session;
+        if (session is null) return;
         var api = _context?.API;
         _ = Task.Run(async () =>
         {
             bool ok;
-            try { ok = await _session.SyncNowAsync(CancellationToken.None); }
+            try { ok = await session.SyncNowAsync(CancellationToken.None); }
             catch (Exception ex)
             {
                 Log.Exception("SyncNowAsync threw", ex, typeof(Main));
@@ -259,9 +260,10 @@ public sealed class Main : IPlugin, IContextMenu, ISettingProvider, IDisposable
             // Failure path surfaces a popup because /sync hits the same endpoint the periodic
             // 15-min timer hits without issue. A manual failure means something's broken.
             if (api is null) return;
+            var error = session.LastError ?? "Sync failed. Restart PowerToys and try again.";
             Application.Current?.Dispatcher.BeginInvoke(new Action(() =>
             {
-                try { api.ShowMsg("Bitwarden", "Sync failed. See PowerToys Run logs.", CurrentIcon); }
+                try { api.ShowMsg("Bitwarden", error, CurrentIcon); }
                 catch (Exception ex) { Log.Exception("ShowMsg after sync failure failed", ex, typeof(Main)); }
             }));
         });
@@ -438,12 +440,6 @@ public sealed class Main : IPlugin, IContextMenu, ISettingProvider, IDisposable
         if (dispatcher is null || session is null) return;
         if (_unlockDialogOpen) return;
         _unlockDialogOpen = true;
-
-        // Kick off a sync now; the user is about to spend seconds typing their master
-        // password, which is free time to refresh the local store from the server. The
-        // unlock path awaits this before reading the cache, so the user sees fresh items
-        // when the vault opens.
-        session.StartBackgroundSync();
 
         // Capture PT Run's HWND now.
         var w = Application.Current?.MainWindow;

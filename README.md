@@ -69,6 +69,30 @@ The master password still controls *unlocking* the vault. You'll be prompted for
 | **Rank results by pick frequency** | on | Items you've copied more often float to the top. |
 | **Bitwarden CLI path (advanced)** | empty | Optional override. Leave empty to resolve `bw.exe` / `bw.cmd` from `PATH`. |
 
+## CLI login and troubleshooting
+
+The plugin uses its own CLI profile under
+`%LOCALAPPDATA%\Microsoft\PowerToys\PowerToys Run\Settings\Plugins\PowerToys.Run.Bitwarden\cli`.
+Your normal terminal CLI profile and login are not reused or modified. An inherited
+`BITWARDENCLI_APPDATA_DIR` or `BW_SESSION` does not override the plugin settings.
+
+On startup and whenever authentication settings change, the plugin replaces its own
+CLI login, applies the configured server, and logs in using the API credentials
+entered in the plugin (including credentials already saved in its encrypted store).
+Clearing the server selects Bitwarden US explicitly. Enter both fields when replacing
+an API credential pair; a partial replacement will not reuse the previous pair.
+Startup and authentication reconfiguration require network access.
+
+Unlock errors identify the failed operation and include an HTTP status or CLI exit
+code when available. Recognized CLI explanations distinguish an incorrect password,
+missing login, decryption failure, rejected API credentials, and connection or TLS
+problems. Unknown response text is withheld because it may contain secrets. Raw CLI
+stdout/stderr and response bodies are not written to plugin logs.
+
+Unlock, sync, and item loading run in order. If a later step fails, the plugin re-locks
+the vault; if re-locking fails, it stops its daemon. A sync or item-loading failure
+therefore no longer appears as an incorrect-password error.
+
 ## Usage
 
 ### First run

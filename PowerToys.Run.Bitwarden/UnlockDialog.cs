@@ -1,3 +1,4 @@
+using PowerToys.Run.Bitwarden.Vault;
 using System.Runtime.InteropServices;
 using System.Security;
 using System.Windows;
@@ -28,7 +29,7 @@ internal sealed class UnlockDialog : Window
     // the dispatcher's unhandled-exception path and crash PT Run.
     private bool _isClosing;
 
-    public Func<SecureString, Task<bool>>? OnUnlockRequested { get; set; }
+    public Func<SecureString, Task<UnlockResult>>? OnUnlockRequested { get; set; }
 
     public UnlockDialog(IntPtr ptRunHwnd = default)
     {
@@ -213,16 +214,15 @@ internal sealed class UnlockDialog : Window
         var requested = OnUnlockRequested;
         try
         {
-            // Run the unlock chain on a thread pool thread: bw unlock and bw serve spawn
-            // synchronously (Process.Start blocks until the child exists).
-            var ok = await Task.Run(() => requested(password));
+            // Keep the unlock transaction off the UI thread.
+            var result = await Task.Run(() => requested(password));
             if (_isClosing) return;
-            if (ok) { DialogResult = true; Close(); return; }
-            _errorLabel.Text = "Unlock failed - wrong master password?";
+            if (result.Success) { DialogResult = true; Close(); return; }
+            _errorLabel.Text = result.Error ?? "Unlock failed. Please try again.";
         }
-        catch (Exception ex)
+        catch (Exception)
         {
-            if (!_isClosing) _errorLabel.Text = "Unlock error: " + ex.Message;
+            if (!_isClosing) _errorLabel.Text = "Unlock could not complete. Please try again or restart PowerToys.";
         }
         finally
         {

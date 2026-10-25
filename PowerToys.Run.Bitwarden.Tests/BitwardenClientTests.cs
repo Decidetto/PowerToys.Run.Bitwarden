@@ -56,6 +56,42 @@ public class BitwardenClientTests
         Assert.DoesNotContain("secret-token", error.ToString());
     }
 
+    [Theory]
+    [InlineData("unlocked", true)]
+    [InlineData("locked", false)]
+    public async Task Unlock_PostUnlockMigrationFailureSucceedsOnlyWhenCliIsUnlocked(string status, bool succeeds)
+    {
+        // bw serve unlocks first, then a failing migration escapes the route as a plain 500.
+        using var client = new BitwardenClient(new Handler(request => request.RequestUri!.AbsolutePath == "/unlock"
+            ? new HttpResponseMessage(HttpStatusCode.InternalServerError) { Content = new StringContent("Internal Server Error") }
+            : new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(System.Text.Json.JsonSerializer.Serialize(
+                    new { success = true, data = new { template = new { status } } }), Encoding.UTF8, "application/json")
+            }), new Uri("http://127.0.0.1/"));
+        using var password = Password();
+        if (succeeds)
+            await client.UnlockAsync(password, default);
+        else
+            Assert.Contains("HTTP 500", (await Assert.ThrowsAsync<BitwardenException>(() => client.UnlockAsync(password, default))).Message);
+    }
+
+    [Fact]
+    public async Task Unlock_RejectedPasswordIsNotRescuedByUnlockedStatus()
+    {
+        using var client = new BitwardenClient(new Handler(request => request.RequestUri!.AbsolutePath == "/unlock"
+            ? new HttpResponseMessage(HttpStatusCode.BadRequest)
+            {
+                Content = new StringContent("""{"success":false,"message":"Invalid master password."}""", Encoding.UTF8, "application/json")
+            }
+            : new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent("""{"success":true,"data":{"template":{"status":"unlocked"}}}""", Encoding.UTF8, "application/json")
+            }), new Uri("http://127.0.0.1/"));
+        using var password = Password();
+        await Assert.ThrowsAsync<BitwardenException>(() => client.UnlockAsync(password, default));
+    }
+
     [Fact]
     public async Task Unlock_SuccessDoesNotSurfaceSessionKey()
     {

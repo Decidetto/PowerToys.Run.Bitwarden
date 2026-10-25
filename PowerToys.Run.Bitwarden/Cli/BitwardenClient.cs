@@ -4,6 +4,7 @@ using System.Net.Http;
 using System.Net.Http.Json;
 using System.Security;
 using System.Text.Json;
+using Wox.Plugin.Logger;
 
 namespace PowerToys.Run.Bitwarden.Cli;
 
@@ -49,10 +50,24 @@ internal sealed class BitwardenClient : IDisposable
     public Task LockAsync(CancellationToken ct)
         => RequestAsync<JsonElement>(HttpMethod.Post, "lock", "Lock vault", null, ct);
 
-    public Task UnlockAsync(SecureString masterPassword, CancellationToken ct)
-        => PasswordHelper.UseAsString(masterPassword, pw =>
-            RequestAsync<JsonElement>(HttpMethod.Post, "unlock", "Unlock vault",
-                JsonContent.Create(new { password = pw }), ct));
+    public async Task UnlockAsync(SecureString masterPassword, CancellationToken ct)
+    {
+        try
+        {
+            await PasswordHelper.UseAsString(masterPassword, pw =>
+                RequestAsync<JsonElement>(HttpMethod.Post, "unlock", "Unlock vault",
+                    JsonContent.Create(new { password = pw }), ct));
+        }
+        catch (BitwardenException ex) when (ex.IsCliInternalError)
+        {
+            // The CLI runs its encrypted-data migrations after the master password has
+            // already unlocked the vault, and a migration failure escapes the route as a
+            // plain HTTP 500. Servers without the user-key-ID backfill endpoint hit this
+            // once per 24-hour cooldown. Wrong passwords fail earlier with HTTP 400.
+            if (await GetStatusAsync(ct) != BwStatus.Unlocked) throw;
+            Log.Warn("The CLI unlocked the vault but a post-unlock step failed (HTTP 500); continuing.", typeof(BitwardenClient));
+        }
+    }
 
     private async Task<T?> RequestAsync<T>(
         HttpMethod method, string path, string operation, HttpContent? content, CancellationToken ct)
@@ -68,7 +83,7 @@ internal sealed class BitwardenClient : IDisposable
             {
                 var envelope = await response.Content.ReadFromJsonAsync<Envelope<JsonElement>>(JsonOptions, ct);
                 if (!response.IsSuccessStatusCode || envelope?.Success != true)
-                    throw BitwardenException.Failure(operation, envelope?.Message, code);
+                    throw BitwardenException.Failure(operation, envelope?.Message, code, (int)response.StatusCode >= 500);
                 return envelope.Data.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined
                     ? default
                     : envelope.Data.Deserialize<T>(JsonOptions);
@@ -78,10 +93,11 @@ internal sealed class BitwardenClient : IDisposable
                 // Koa returns plain text when an unhandled CLI exception escapes the
                 // route (including post-unlock migrations on incompatible servers).
                 // The HTTP failure is meaningful even though it has no JSON envelope.
-                var reason = (int)response.StatusCode >= 500
+                var internalError = (int)response.StatusCode >= 500;
+                var reason = internalError
                     ? "an internal CLI error occurred. Check compatibility between your Bitwarden CLI and vault server."
                     : "the CLI returned an invalid response.";
-                throw new BitwardenException($"{operation} failed ({code}): {reason}");
+                throw new BitwardenException($"{operation} failed ({code}): {reason}") { IsCliInternalError = internalError };
             }
         }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)

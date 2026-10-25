@@ -6,8 +6,11 @@ internal sealed class BitwardenException : Exception
 {
     public BitwardenException(string message) : base(message) { }
 
-    public static BitwardenException Failure(string operation, string? explanation, string code)
-        => new($"{operation} failed ({code}). {Explain(explanation)}");
+    // An exception escaped the CLI route (HTTP 5xx), so the command may have partially run.
+    public bool IsCliInternalError { get; init; }
+
+    public static BitwardenException Failure(string operation, string? explanation, string code, bool internalError = false)
+        => new($"{operation} failed ({code}). {Explain(explanation)}") { IsCliInternalError = internalError };
 
     internal static string Explain(string? message)
     {
